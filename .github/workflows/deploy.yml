@@ -1,0 +1,215 @@
+# =============================================================================
+# Media Processing API - CI/CD Pipeline
+# =============================================================================
+# Triggers on push to main branch
+#
+# CI: Build Docker image and push to GitHub Container Registry (GHCR)
+# CD: Deploy to VPS via SSH
+#
+# Required Secrets:
+#   - VPS_SSH_PRIVATE_KEY: SSH private key for VPS access
+#   - VPS_HOST: VPS IP address (157.66.100.59)
+#   - VPS_USER: SSH user (root)
+#
+# GHCR authentication uses GITHUB_TOKEN (automatic)
+# =============================================================================
+
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  # Allow manual trigger for rollbacks or re-deploys
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (leave empty for latest commit)'
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DEPLOY_PATH: /opt/services/media-processing-api
+
+jobs:
+  # ===========================================================================
+  # CI: Build and Push Docker Image
+  # ===========================================================================
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Tag with commit SHA (primary tag for deployments)
+            type=sha,prefix=,format=short
+            # Tag as latest for main branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            # Tag with branch name
+            type=ref,event=branch
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build arguments if needed
+          # build-args: |
+          #   WHISPER_MODEL=base
+
+      - name: Output image info
+        run: |
+          echo "Image pushed successfully"
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+          echo "Digest: ${{ steps.build.outputs.digest }}"
+
+  # ===========================================================================
+  # CD: Deploy to VPS
+  # ===========================================================================
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: build
+    # Only deploy on push to main (not on PRs)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Determine image tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ needs.build.outputs.image_tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Add VPS to known hosts to prevent interactive prompt
+          ssh-keyscan -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Create deployment directory on VPS
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
+            "mkdir -p ${{ env.DEPLOY_PATH }}/data"
+
+      - name: Copy docker-compose.yml to VPS
+        run: |
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            docker-compose.prod.yml \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ env.DEPLOY_PATH }}/docker-compose.yml
+
+      - name: Deploy to VPS
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} << 'DEPLOY_SCRIPT'
+          set -euo pipefail
+
+          cd ${{ env.DEPLOY_PATH }}
+
+          # Export environment variables for docker-compose
+          export IMAGE_TAG="${{ steps.tag.outputs.tag }}"
+          export GITHUB_REPOSITORY="${{ github.repository }}"
+
+          # Create .env file for docker-compose
+          cat > .env << EOF
+          IMAGE_TAG=${{ steps.tag.outputs.tag }}
+          GITHUB_REPOSITORY=${{ github.repository }}
+          EOF
+
+          # Login to GHCR (using GitHub token passed via secret)
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+          # Pull the new image
+          echo "Pulling image: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag }}"
+          docker compose pull
+
+          # Restart only this service (does NOT affect other services)
+          echo "Starting container..."
+          docker compose up -d --remove-orphans
+
+          # Wait for health check
+          echo "Waiting for service to be healthy..."
+          sleep 10
+
+          # Verify deployment
+          if docker compose ps | grep -q "healthy\|running"; then
+            echo "✅ Deployment successful!"
+            docker compose ps
+          else
+            echo "❌ Deployment may have issues"
+            docker compose logs --tail=50
+            exit 1
+          fi
+
+          # Cleanup old images (keep last 3)
+          echo "Cleaning up old images..."
+          docker image prune -f --filter "until=24h" || true
+
+          DEPLOY_SCRIPT
+
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no \
+            ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }} \
+            "curl -sf http://127.0.0.1:9300/health || echo 'Health check pending...'"
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
+
+  # ===========================================================================
+  # Notify on failure (optional)
+  # ===========================================================================
+  notify-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [build, deploy]
+    if: failure()
+    steps:
+      - name: Send failure notification
+        run: |
+          echo "::error::Deployment failed! Check the logs above for details."
+          # Add Slack/Discord/Email notification here if needed

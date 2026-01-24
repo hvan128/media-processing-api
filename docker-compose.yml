@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  media-api:
+    build: .
+    container_name: media-api
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist output files and job data
+      - ./data:/data
+    environment:
+      # Reduce PyTorch memory usage
+      - OMP_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
+    restart: unless-stopped
+    # Resource limits for VPS with 2-4GB RAM
+    deploy:
+      resources:
+        limits:
+          memory: 3G
+        reservations:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 30s
+      retries: 3
+      start_period: 120s  # Allow time for model loading

@@ -1,0 +1,73 @@
+# =============================================================================
+# Media Processing API - Production Docker Compose
+# =============================================================================
+# Location on VPS: /opt/services/media-processing-api/docker-compose.yml
+#
+# Usage:
+#   docker compose pull
+#   docker compose up -d
+#
+# This file is designed for single-VPS deployment with:
+#   - GHCR image pull (no local build)
+#   - localhost-only port binding (not public)
+#   - Memory limits to prevent OOM
+#   - Persistent data volume
+# =============================================================================
+
+services:
+  media-processing-api:
+    image: ghcr.io/${GITHUB_REPOSITORY:-your-org/media-processing-api}:${IMAGE_TAG:-latest}
+    container_name: media-processing-api
+    restart: unless-stopped
+
+    # SECURITY: Bind to localhost only - NOT publicly accessible
+    # Access via nginx reverse proxy or internal services only
+    ports:
+      - "127.0.0.1:9300:8000"
+
+    # Persistent storage for job outputs and temp files
+    volumes:
+      - ./data:/data
+
+    environment:
+      # Limit CPU threads to prevent resource exhaustion
+      - OMP_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
+      # Disable Python output buffering for real-time logs
+      - PYTHONUNBUFFERED=1
+
+    # Resource limits for VPS with limited RAM
+    # Adjust based on your VPS specs (2-4GB total recommended)
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+        reservations:
+          memory: 1g
+
+    # Health check for monitoring
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+    # Logging configuration
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+    # Security: Run as non-root (optional, uncomment if image supports it)
+    # user: "1000:1000"
+
+    # Network isolation (optional, for additional security)
+    # networks:
+    #   - internal
+
+# Optional: Define isolated network
+# networks:
+#   internal:
+#     driver: bridge
