@@ -14,15 +14,28 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # Install system dependencies
-# - ffmpeg: Audio/video processing
+# - ffmpeg: Audio/video processing (runtime)
+# - libavformat-dev, libavcodec-dev, etc.: FFmpeg dev libraries for PyAV
 # - libsndfile1: Audio file reading (for Demucs)
 # - git: Required by some Python packages
 # - curl: Health checks
+# - pkg-config: Required for building PyAV
+# - gcc, python3-dev: Build tools for compiling native extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    libavformat-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavutil-dev \
+    libswscale-dev \
+    libswresample-dev \
+    libavfilter-dev \
     libsndfile1 \
     git \
     curl \
+    pkg-config \
+    gcc \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app directory
@@ -34,11 +47,15 @@ RUN mkdir -p /data/output /data/jobs
 # Install Python dependencies
 # Split into stages for better caching:
 # 1. Install PyTorch CPU-only first (large, rarely changes)
-# 2. Install other dependencies
+# 2. Install PyAV (requires FFmpeg dev libs)
+# 3. Install other dependencies
 
 # Install PyTorch CPU-only (saves ~1GB vs full torch)
 RUN pip install torch==2.1.2+cpu torchaudio==2.1.2+cpu \
     -f https://download.pytorch.org/whl/torch_stable.html
+
+# Install PyAV (required by faster-whisper)
+RUN pip install av
 
 # Copy requirements and install remaining dependencies
 COPY requirements.txt .
@@ -49,6 +66,9 @@ RUN pip install --no-deps faster-whisper==1.0.0 && \
     pip install fastapi==0.109.0 uvicorn[standard]==0.27.0 \
     python-multipart==0.0.6 httpx==0.26.0 aiofiles==23.2.1 \
     pydantic==2.5.3 python-dotenv==1.0.0
+
+# Install remaining faster-whisper dependencies (excluding av which is already installed)
+RUN pip install ctranslate2 huggingface_hub tokenizers onnxruntime
 
 # Pre-download ML models during build (optional, reduces first-run latency)
 # Uncomment these lines to include models in the image:
