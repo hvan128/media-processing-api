@@ -4,19 +4,21 @@ Vocal Separation Service Module
 Handles vocal separation using Demucs.
 
 Design Decisions:
-- Uses htdemucs_ft model with 2-stem separation (vocals/no_vocals)
+- Uses htdemucs model with 2-stem separation (vocals/no_vocals)
 - Model loaded once at startup to avoid repeated loading
 - CPU-only operation with optimized parameters
 - Only returns no_vocals track as per requirements
-- Uses FFmpeg for audio conversion to avoid torchaudio backend dependencies
+- Uses Demucs as a LIBRARY (not CLI) to avoid torchaudio.save() calls
+- Uses FFmpeg for audio loading and saving to avoid torchaudio backends
 """
 
 import shutil
 import subprocess
 import asyncio
 import logging
+import numpy as np
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -32,8 +34,9 @@ logger = logging.getLogger(__name__)
 MODEL_NAME = "htdemucs"
 DEVICE = "cpu"
 
-# Global model instance
+# Global model instance and apply function
 _separator = None
+_apply_model = None
 _model_loaded = False
 
 
@@ -41,22 +44,18 @@ def load_model():
     """
     Pre-load Demucs model into memory.
     
-    Demucs uses a different loading pattern - we'll use the CLI approach
-    which handles model caching automatically. This function ensures
-    the model is downloaded and cached on first run.
+    Loads Demucs model as a library (not CLI) to avoid torchaudio.save() calls.
     """
-    global _model_loaded
+    global _model_loaded, _separator, _apply_model
     
     if _model_loaded:
         return
     
-    print(f"Initializing Demucs ({MODEL_NAME}) for CPU...")
+    print(f"Initializing Demucs ({MODEL_NAME}) as library for CPU...")
     
     # Set torch to use CPU
     torch.set_num_threads(4)  # Reasonable thread count for VPS
     
-    # Demucs will download/cache the model on first use
-    # We can pre-trigger this by importing the module
     try:
         from demucs.pretrained import get_model
         from demucs.apply import apply_model
@@ -64,13 +63,14 @@ def load_model():
         # Load model to trigger download
         model = get_model(MODEL_NAME)
         model.to(DEVICE)
+        model.eval()  # Set to evaluation mode
         
         # Store for reuse
-        global _separator
         _separator = model
+        _apply_model = apply_model
         
         _model_loaded = True
-        print("Demucs model loaded successfully")
+        print("Demucs model loaded successfully (library mode)")
         
     except Exception as e:
         print(f"Error loading Demucs model: {e}")
@@ -84,24 +84,38 @@ def get_model():
     return _separator
 
 
-async def run_ffmpeg_convert(input_path: Path, output_path: Path) -> None:
+def get_apply_model():
+    """Get the apply_model function"""
+    if not _model_loaded:
+        raise RuntimeError("Demucs model not loaded. Call load_model() first.")
+    return _apply_model
+
+
+async def load_audio_with_ffmpeg(audio_path: Path) -> Tuple[torch.Tensor, int]:
     """
-    Convert audio file to WAV using FFmpeg.
+    Load audio file using FFmpeg and convert to torch tensor.
     
-    This bypasses torchaudio entirely and uses FFmpeg directly.
+    This bypasses torchaudio entirely and uses FFmpeg to decode audio.
     
     Args:
-        input_path: Path to input audio file (any format)
-        output_path: Path to output WAV file
-    """
-    logger.info(f"Converting {input_path} to WAV using FFmpeg: {output_path}")
+        audio_path: Path to input audio file (any format)
     
+    Returns:
+        Tuple of (audio_tensor, sample_rate)
+        audio_tensor: Shape (channels, samples) as float32 tensor
+        sample_rate: Sample rate in Hz
+    """
+    logger.info(f"Loading audio with FFmpeg: {audio_path}")
+    
+    # Use FFmpeg to decode audio to raw PCM (16-bit signed little-endian)
+    # Output format: -f s16le = signed 16-bit little-endian PCM
     cmd = [
-        "ffmpeg", "-y",  # -y to overwrite output
-        "-i", str(input_path),
-        "-acodec", "pcm_s16le",  # 16-bit PCM WAV
-        "-ar", "44100",  # 44.1kHz sample rate
-        str(output_path)
+        "ffmpeg", "-i", str(audio_path),
+        "-f", "s16le",  # Raw PCM format
+        "-acodec", "pcm_s16le",
+        "-ar", "44100",  # Resample to 44.1kHz (Demucs standard)
+        "-ac", "2",  # Convert to stereo (2 channels)
+        "-"  # Output to stdout
     ]
     
     process = await asyncio.create_subprocess_exec(
@@ -114,23 +128,95 @@ async def run_ffmpeg_convert(input_path: Path, output_path: Path) -> None:
     
     if process.returncode != 0:
         error_msg = stderr.decode() if stderr else "Unknown error"
-        raise RuntimeError(f"FFmpeg conversion failed: {error_msg}")
+        raise RuntimeError(f"FFmpeg audio loading failed: {error_msg}")
+    
+    # Convert raw PCM bytes to numpy array
+    # s16le = signed 16-bit little-endian, so we use int16
+    audio_data = np.frombuffer(stdout, dtype=np.int16)
+    
+    # Reshape to (channels, samples)
+    # We specified 2 channels, so reshape accordingly
+    num_channels = 2
+    num_samples = len(audio_data) // num_channels
+    audio_data = audio_data[:num_samples * num_channels].reshape(num_channels, num_samples)
+    
+    # Convert to float32 and normalize to [-1.0, 1.0]
+    audio_tensor = torch.from_numpy(audio_data.astype(np.float32) / 32768.0)
+    
+    sample_rate = 44100  # We resampled to 44.1kHz
+    
+    logger.info(f"Loaded audio: shape={audio_tensor.shape}, sample_rate={sample_rate}")
+    
+    return audio_tensor, sample_rate
+
+
+async def save_audio_with_ffmpeg(audio_tensor: torch.Tensor, sample_rate: int, output_path: Path) -> None:
+    """
+    Save audio tensor to WAV file using FFmpeg.
+    
+    This bypasses torchaudio entirely and uses FFmpeg to encode audio.
+    
+    Args:
+        audio_tensor: Audio tensor with shape (channels, samples) as float32
+        sample_rate: Sample rate in Hz
+        output_path: Path to output WAV file
+    """
+    logger.info(f"Saving audio with FFmpeg: {output_path}, shape={audio_tensor.shape}, sr={sample_rate}")
+    
+    # Ensure output directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Convert tensor to numpy and denormalize to int16
+    audio_np = audio_tensor.cpu().numpy()
+    # Clamp to [-1, 1] range
+    audio_np = np.clip(audio_np, -1.0, 1.0)
+    # Convert to int16
+    audio_int16 = (audio_np * 32767.0).astype(np.int16)
+    
+    # Convert to bytes (little-endian)
+    audio_bytes = audio_int16.tobytes()
+    
+    # Use FFmpeg to encode to WAV
+    # Input: raw PCM (s16le) from stdin
+    # Output: WAV file
+    cmd = [
+        "ffmpeg", "-y",  # Overwrite output
+        "-f", "s16le",  # Input format: signed 16-bit little-endian
+        "-ar", str(sample_rate),  # Sample rate
+        "-ac", str(audio_tensor.shape[0]),  # Number of channels
+        "-i", "-",  # Read from stdin
+        "-acodec", "pcm_s16le",  # Output codec
+        str(output_path)
+    ]
+    
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    
+    stdout, stderr = await process.communicate(input=audio_bytes)
+    
+    if process.returncode != 0:
+        error_msg = stderr.decode() if stderr else "Unknown error"
+        raise RuntimeError(f"FFmpeg audio saving failed: {error_msg}")
     
     if not output_path.exists():
-        raise RuntimeError(f"FFmpeg conversion completed but output file not found: {output_path}")
+        raise RuntimeError(f"FFmpeg saving completed but output file not found: {output_path}")
     
-    logger.info(f"Successfully converted to WAV: {output_path}")
+    logger.info(f"Successfully saved audio: {output_path}")
 
 
-async def run_demucs_cli(audio_path: Path, output_dir: Path) -> Path:
+async def run_demucs_library(audio_path: Path, output_dir: Path) -> Path:
     """
-    Run Demucs separation using the CLI.
+    Run Demucs separation using the library API (NOT CLI).
     
-    This uses subprocess to run Demucs, which is more reliable
-    for CPU-only environments and handles memory better.
-    
-    After Demucs finishes, converts output to WAV using FFmpeg
-    to avoid torchaudio backend dependencies.
+    This avoids torchaudio.save() calls entirely by:
+    1. Loading audio with FFmpeg
+    2. Running Demucs inference in memory
+    3. Extracting no_vocals source
+    4. Saving with FFmpeg
     
     Args:
         audio_path: Path to input audio file
@@ -142,110 +228,62 @@ async def run_demucs_cli(audio_path: Path, output_dir: Path) -> Path:
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Build demucs command
-    # -n htdemucs: Use htdemucs model
-    # --two-stems vocals: Only separate vocals (creates vocals and no_vocals)
-    # -d cpu: Force CPU device
-    # -o: Output directory
-    # Note: We let Demucs output in its default format, then convert with FFmpeg
+    logger.info(f"Running Demucs separation (library mode) on: {audio_path}")
     
-    cmd = [
-        "python", "-m", "demucs",
-        "-n", MODEL_NAME,
-        "--two-stems", "vocals",
-        "-d", DEVICE,
-        "-o", str(output_dir),
-        str(audio_path)
-    ]
+    # Step 1: Load audio using FFmpeg (no torchaudio)
+    audio_tensor, sample_rate = await load_audio_with_ffmpeg(audio_path)
     
-    logger.info(f"Running Demucs command: {' '.join(cmd)}")
+    # Step 2: Get model and apply function
+    model = get_model()
+    apply_model = get_apply_model()
     
-    # Run in subprocess
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
+    # Step 3: Prepare audio for Demucs
+    # Demucs expects shape (batch, channels, samples)
+    # Add batch dimension
+    audio_batch = audio_tensor.unsqueeze(0)  # Shape: (1, channels, samples)
     
-    stdout, stderr = await process.communicate()
+    logger.info(f"Running Demucs inference on audio shape: {audio_batch.shape}")
     
-    stdout_text = stdout.decode() if stdout else ""
-    stderr_text = stderr.decode() if stderr else ""
-    
-    logger.info(f"Demucs stdout: {stdout_text[:500]}")  # Log first 500 chars
-    if stderr_text:
-        logger.info(f"Demucs stderr: {stderr_text[:500]}")
-    
-    if process.returncode != 0:
-        error_msg = stderr_text if stderr_text else "Unknown error"
-        raise RuntimeError(f"Demucs process failed (code {process.returncode}): {error_msg}")
-    
-    # Demucs outputs to: output_dir/htdemucs/audio_filename/no_vocals.*
-    audio_stem = audio_path.stem
-    demucs_output_subdir = output_dir / MODEL_NAME / audio_stem
-    
-    logger.info(f"Checking for Demucs output in: {demucs_output_subdir}")
-    
-    if not demucs_output_subdir.exists():
-        raise RuntimeError(f"Demucs output directory not found: {demucs_output_subdir}")
-    
-    # List all files in the output directory
-    output_files = list(demucs_output_subdir.iterdir())
-    logger.info(f"Files found in Demucs output directory: {[f.name for f in output_files]}")
-    
-    # Look for no_vocals file (could be .wav, .mp3, or other format)
-    no_vocals_candidates = [
-        demucs_output_subdir / "no_vocals.wav",
-        demucs_output_subdir / "no_vocals.mp3",
-        demucs_output_subdir / "no_vocals.flac",
-    ]
-    
-    # Also check for any file starting with "no_vocals"
-    for file in output_files:
-        if file.stem == "no_vocals" and file not in no_vocals_candidates:
-            no_vocals_candidates.append(file)
-    
-    # Find the actual no_vocals file
-    no_vocals_input = None
-    for candidate in no_vocals_candidates:
-        if candidate.exists():
-            no_vocals_input = candidate
-            logger.info(f"Found no_vocals file: {no_vocals_input}")
-            break
-    
-    if no_vocals_input is None:
-        raise RuntimeError(
-            f"no_vocals file not found in {demucs_output_subdir}. "
-            f"Available files: {[f.name for f in output_files]}"
+    # Step 4: Run Demucs inference
+    # Use full separation and combine non-vocal sources to get no_vocals
+    # This avoids needing two_stems parameter which may not be available in apply_model
+    with torch.no_grad():
+        sources = apply_model(
+            model,
+            audio_batch,
+            device=DEVICE,
+            shifts=1,  # Number of random shifts for better quality
+            split=True,  # Split long audio into chunks
+            overlap=0.25,  # Overlap between chunks
+            progress=False
         )
+        
+        # Sources shape: (batch, sources, channels, samples)
+        # For htdemucs, sources order is typically: [drums, bass, other, vocals]
+        # no_vocals = drums + bass + other (everything except vocals)
+        if sources.shape[1] == 4:
+            # Standard 4-source separation: drums, bass, other, vocals
+            no_vocals = sources[0, 0:3].sum(dim=0)  # Sum drums, bass, other
+        elif sources.shape[1] == 2:
+            # Two-stem separation: assume index 1 is no_vocals
+            no_vocals = sources[0, 1]
+        else:
+            # Fallback: sum all sources except the last (assuming last is vocals)
+            logger.warning(f"Unexpected number of sources: {sources.shape[1]}, using fallback")
+            no_vocals = sources[0, :-1].sum(dim=0)
     
-    # Always convert to WAV using FFmpeg to avoid torchaudio dependencies
-    # This ensures we have a reliable WAV output regardless of Demucs output format
-    no_vocals_wav = demucs_output_subdir / "no_vocals.wav"
+    logger.info(f"Demucs inference completed. no_vocals shape: {no_vocals.shape}")
     
-    # If it's already WAV and we trust it, we could skip conversion
-    # But to be safe and ensure compatibility, we always convert
-    if no_vocals_input.suffix.lower() == ".wav":
-        # Still convert to ensure proper WAV format and avoid torchaudio issues
-        temp_wav = demucs_output_subdir / "no_vocals_temp.wav"
-        await run_ffmpeg_convert(no_vocals_input, temp_wav)
-        # Replace original with converted version
-        if no_vocals_input != temp_wav:
-            no_vocals_input.unlink()  # Remove original
-            temp_wav.rename(no_vocals_wav)  # Rename temp to final
-    else:
-        # Convert from non-WAV format to WAV
-        await run_ffmpeg_convert(no_vocals_input, no_vocals_wav)
-        # Optionally remove original non-WAV file to save space
-        if no_vocals_input != no_vocals_wav:
-            no_vocals_input.unlink()
+    # Step 5: Save no_vocals using FFmpeg (no torchaudio)
+    output_path = output_dir / "no_vocals.wav"
+    await save_audio_with_ffmpeg(no_vocals, sample_rate, output_path)
     
-    if not no_vocals_wav.exists():
-        raise RuntimeError(f"Final no_vocals.wav file not found after conversion: {no_vocals_wav}")
+    if not output_path.exists():
+        raise RuntimeError(f"Output file not found after saving: {output_path}")
     
-    logger.info(f"Successfully created no_vocals.wav: {no_vocals_wav}")
+    logger.info(f"Successfully created no_vocals.wav: {output_path}")
     
-    return no_vocals_wav
+    return output_path
 
 
 async def process_separation(job: Job, manager: JobManager) -> dict:
@@ -283,7 +321,7 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     logger.info(f"Audio downloaded to: {audio_path}")
     await manager.update_progress(job.job_id, 20)
     
-    # Step 2: Run Demucs separation
+    # Step 2: Run Demucs separation (library mode, no CLI)
     # Wait for model to be ready (models load in background during startup)
     # Models can take 30-90 seconds to load, so we wait up to 120 seconds
     import time
@@ -304,9 +342,9 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     # so we'll update progress in steps
     await manager.update_progress(job.job_id, 30)
     
-    # Run separation
-    logger.info("Starting Demucs separation process")
-    no_vocals_path = await run_demucs_cli(audio_path, demucs_output_dir)
+    # Run separation using library (NOT CLI - avoids torchaudio.save())
+    logger.info("Starting Demucs separation process (library mode)")
+    no_vocals_path = await run_demucs_library(audio_path, demucs_output_dir)
     logger.info(f"Demucs separation completed. Output: {no_vocals_path}")
     
     await manager.update_progress(job.job_id, 90)
