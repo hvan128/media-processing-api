@@ -17,6 +17,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # - ffmpeg: Audio/video processing (runtime)
 # - libavformat-dev, libavcodec-dev, etc.: FFmpeg dev libraries for PyAV
 # - libsndfile1: Audio file reading (for Demucs)
+# - libgomp: OpenMP library required by CTranslate2 (faster-whisper)
 # - git: Required by some Python packages
 # - curl: Health checks
 # - pkg-config: Required for building PyAV
@@ -31,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libswresample-dev \
     libavfilter-dev \
     libsndfile1 \
+    libgomp1 \
     git \
     curl \
     pkg-config \
