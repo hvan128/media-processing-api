@@ -52,7 +52,8 @@ RUN mkdir -p /data/output /data/jobs
 # 4. Install other dependencies
 
 # Install NumPy (required by PyTorch, install first to avoid compatibility issues)
-RUN pip install numpy
+# Pin to version compatible with PyTorch 2.1.2
+RUN pip install "numpy<1.25.0"
 
 # Install PyTorch CPU-only (saves ~1GB vs full torch)
 RUN pip install torch==2.1.2+cpu torchaudio==2.1.2+cpu \
