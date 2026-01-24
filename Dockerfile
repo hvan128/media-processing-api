@@ -46,9 +46,13 @@ RUN mkdir -p /data/output /data/jobs
 
 # Install Python dependencies
 # Split into stages for better caching:
-# 1. Install PyTorch CPU-only first (large, rarely changes)
-# 2. Install PyAV (requires FFmpeg dev libs)
-# 3. Install other dependencies
+# 1. Install NumPy first (required by PyTorch)
+# 2. Install PyTorch CPU-only (large, rarely changes)
+# 3. Install PyAV (requires FFmpeg dev libs)
+# 4. Install other dependencies
+
+# Install NumPy (required by PyTorch, install first to avoid compatibility issues)
+RUN pip install numpy
 
 # Install PyTorch CPU-only (saves ~1GB vs full torch)
 RUN pip install torch==2.1.2+cpu torchaudio==2.1.2+cpu \
