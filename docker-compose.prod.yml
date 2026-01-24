@@ -63,11 +63,9 @@ services:
     # Security: Run as non-root (optional, uncomment if image supports it)
     # user: "1000:1000"
 
-    # Network isolation (optional, for additional security)
-    # networks:
-    #   - internal
+    networks:
+      - internal-net
 
-# Optional: Define isolated network
-# networks:
-#   internal:
-#     driver: bridge
+networks:
+  internal-net:
+    external: true
