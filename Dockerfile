@@ -68,7 +68,7 @@ RUN pip install --no-deps faster-whisper==1.0.0 && \
     pydantic==2.5.3 python-dotenv==1.0.0
 
 # Install remaining faster-whisper dependencies (excluding av which is already installed)
-RUN pip install ctranslate2 huggingface_hub tokenizers onnxruntime
+RUN pip install ctranslate2 huggingface_hub tokenizers onnxruntime requests
 
 # Pre-download ML models during build (optional, reduces first-run latency)
 # Uncomment these lines to include models in the image:
