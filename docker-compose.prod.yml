@@ -20,10 +20,13 @@ services:
     container_name: media-processing-api
     restart: unless-stopped
 
+    networks:
+      - internal-net
+
     # SECURITY: Bind to localhost only - NOT publicly accessible
     # Access via nginx reverse proxy or internal services only
     ports:
-      - "127.0.0.1:9300:8000"
+      - "127.0.0.1:9300:8000"   # giữ nguyên cho debug
 
     # Persistent storage for job outputs and temp files
     volumes:
@@ -62,9 +65,6 @@ services:
 
     # Security: Run as non-root (optional, uncomment if image supports it)
     # user: "1000:1000"
-
-    networks:
-      - internal-net
 
 networks:
   internal-net:
