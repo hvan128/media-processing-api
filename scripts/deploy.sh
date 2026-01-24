@@ -25,7 +25,7 @@ set -euo pipefail
 VPS_HOST="${VPS_HOST:-157.66.100.59}"
 VPS_USER="${VPS_USER:-root}"
 DEPLOY_PATH="/opt/services/media-processing-api"
-GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-your-org/media-processing-api}"
+GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-hvan128/Media-Processing-API}"
 IMAGE_TAG="${1:-latest}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
