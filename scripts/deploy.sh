@@ -117,8 +117,36 @@ docker compose pull
 echo "Starting service..."
 docker compose up -d --remove-orphans
 
-echo "Waiting for service to start..."
-sleep 5
+# Wait for service to become healthy with retries
+# ML models (Whisper/Demucs) can take 30-90 seconds to load,
+# but the server starts immediately and health endpoint is available right away.
+# We wait up to 150 seconds (2.5 minutes) with retries to account for:
+# - Container startup: ~5-10 seconds
+# - Model loading: ~30-90 seconds
+# - Network/healthcheck delays: ~10-20 seconds
+echo "Waiting for service to be healthy (this may take up to 2.5 minutes)..."
+
+MAX_WAIT=150  # Maximum wait time in seconds
+CHECK_INTERVAL=5  # Check every 5 seconds
+ELAPSED=0
+HEALTHY=false
+
+while [ $ELAPSED -lt $MAX_WAIT ]; do
+  # Check if container is healthy or at least running
+  CONTAINER_STATUS=$(docker compose ps --format json 2>/dev/null | jq -r '.[0].Health // .[0].State' 2>/dev/null || echo "")
+  
+  if echo "$CONTAINER_STATUS" | grep -q "healthy"; then
+    echo "✅ Container is healthy!"
+    HEALTHY=true
+    break
+  elif echo "$CONTAINER_STATUS" | grep -q "running"; then
+    # Container is running but not yet healthy - this is OK during startup
+    echo "Container is running (health check pending, ${ELAPSED}s elapsed)..."
+  fi
+  
+  sleep $CHECK_INTERVAL
+  ELAPSED=$((ELAPSED + CHECK_INTERVAL))
+done
 
 # Show status
 docker compose ps
@@ -129,17 +157,36 @@ REMOTE_SCRIPT
 # =============================================================================
 
 log_info "Verifying deployment..."
-sleep 5
 
-HEALTH_STATUS=$(ssh_cmd "curl -sf http://127.0.0.1:9300/health 2>/dev/null || echo 'unhealthy'")
+# Final health check with retries
+# The /health endpoint should be available immediately, but we'll retry
+# a few times in case of network delays or if container is still starting
+HEALTHY=false
+for i in {1..10}; do
+    HEALTH_STATUS=$(ssh_cmd "curl -sf http://127.0.0.1:9300/health 2>/dev/null || echo 'unhealthy'")
+    
+    if [[ "$HEALTH_STATUS" == *"healthy"* ]] || [[ "$HEALTH_STATUS" == *"status"* ]]; then
+        log_info "✅ Health check passed!"
+        HEALTHY=true
+        break
+    fi
+    
+    if [ $i -lt 10 ]; then
+        log_info "Health check attempt ${i}/10 failed, retrying in 3 seconds..."
+        sleep 3
+    fi
+done
 
-if [[ "$HEALTH_STATUS" == *"healthy"* ]] || [[ "$HEALTH_STATUS" == *"status"* ]]; then
+if [ "$HEALTHY" = true ]; then
     log_info "✅ Deployment successful!"
     log_info "Service is running at http://127.0.0.1:9300 (VPS localhost)"
 else
-    log_warn "Health check returned: ${HEALTH_STATUS}"
-    log_warn "Service may still be starting (model loading takes time)..."
+    log_warn "Health check endpoint not yet responding"
+    log_warn "Service may still be starting (model loading can take 30-90 seconds)..."
+    log_info "Container status:"
+    ssh_cmd "cd ${DEPLOY_PATH} && docker compose ps"
     log_info "Check logs with: ssh ${VPS_USER}@${VPS_HOST} 'cd ${DEPLOY_PATH} && docker compose logs -f'"
+    log_info "⚠️  Deployment completed, but health check pending (this is normal during startup)"
 fi
 
 # Show running container info

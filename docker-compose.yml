@@ -21,9 +21,16 @@ services:
           memory: 3G
         reservations:
           memory: 1G
+    # Health check for monitoring
+    # IMPORTANT: start_period=120s allows time for ML model loading (Whisper/Demucs)
+    # Models can take 30-90 seconds to load on first startup, but the FastAPI
+    # server starts immediately and /health endpoint returns 200 right away.
+    # This ensures health checks pass during the startup window even while
+    # models are still loading in the background.
+    # Note: Using curl instead of Python httpx for consistency with production
     healthcheck:
-      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8000/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 30s
+      timeout: 10s
       retries: 3
-      start_period: 120s  # Allow time for model loading
+      start_period: 120s

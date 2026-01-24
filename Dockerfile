@@ -89,6 +89,11 @@ COPY *.py .
 EXPOSE 8000
 
 # Health check
+# IMPORTANT: start-period=120s allows time for ML model loading (Whisper/Demucs)
+# Models can take 30-90 seconds to load on first startup, but the FastAPI
+# server starts immediately and /health endpoint returns 200 right away.
+# This ensures health checks pass during the startup window even while
+# models are still loading in the background.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
