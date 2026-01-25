@@ -30,11 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 # Demucs configuration
-# Using "demucs_quantized" - CPU-optimized quantized CNN model
-# NOT htdemucs or htdemucs_ft (transformers are too slow on CPU)
+# Using "htdemucs" - the only valid/available pretrained model
 # Full 4-stem separation, then compute no_vocals = drums + bass + other
 # Optimized for CPU: mono input, 16kHz sample rate, no shifts, no overlap
-MODEL_NAME = "demucs_quantized"
+MODEL_NAME = "htdemucs"
 DEVICE = "cpu"
 # Target sample rate for CPU optimization (16kHz for speed)
 TARGET_SAMPLE_RATE = 16000
@@ -105,8 +104,8 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     Load audio file using FFmpeg and convert to torch tensor (SYNCHRONOUS).
     
     OPTIMIZED for CPU speed:
-    - Converts to MONO (1 channel) for faster processing
-    - Resamples to 16kHz for faster inference
+    - Stereo (2 channels) - required by htdemucs model
+    - Resamples to 16kHz for faster inference (~2.75x speedup vs 44.1kHz)
     
     This is a blocking operation that must run in an executor.
     Uses subprocess.run (not asyncio) to avoid blocking the event loop.
@@ -116,13 +115,13 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     
     Returns:
         Tuple of (audio_tensor, sample_rate)
-        audio_tensor: Shape (1, samples) as float32 tensor (mono)
+        audio_tensor: Shape (2, samples) as float32 tensor (stereo)
         sample_rate: Sample rate in Hz (TARGET_SAMPLE_RATE)
     """
     logger.info(f"Loading audio with FFmpeg (sync, optimized for CPU): {audio_path}")
     
     # Use FFmpeg to decode and preprocess audio:
-    # - Convert to MONO (1 channel) for speed
+    # - Stereo (2 channels) - required by htdemucs
     # - Resample to TARGET_SAMPLE_RATE (16kHz) for speed
     # - Output as raw PCM (16-bit signed little-endian)
     cmd = [
@@ -130,7 +129,7 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
         "-f", "s16le",  # Raw PCM format
         "-acodec", "pcm_s16le",
         "-ar", str(TARGET_SAMPLE_RATE),  # Resample to target rate (16kHz)
-        "-ac", "1",  # Convert to MONO (1 channel) for speed
+        "-ac", "2",  # Stereo (2 channels) - required by htdemucs
         "-"  # Output to stdout
     ]
     
@@ -150,13 +149,15 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     # s16le = signed 16-bit little-endian, so we use int16
     audio_data = np.frombuffer(result.stdout, dtype=np.int16)
     
-    # Reshape to (1, samples) for mono
-    audio_data = audio_data.reshape(1, -1)
+    # Reshape to (2, samples) for stereo
+    num_channels = 2
+    num_samples = len(audio_data) // num_channels
+    audio_data = audio_data[:num_samples * num_channels].reshape(num_channels, num_samples)
     
     # Convert to float32 and normalize to [-1.0, 1.0]
     audio_tensor = torch.from_numpy(audio_data.astype(np.float32) / 32768.0)
     
-    logger.info(f"Loaded audio (mono, {TARGET_SAMPLE_RATE}Hz): shape={audio_tensor.shape}, sample_rate={TARGET_SAMPLE_RATE}")
+    logger.info(f"Loaded audio (stereo, {TARGET_SAMPLE_RATE}Hz): shape={audio_tensor.shape}, sample_rate={TARGET_SAMPLE_RATE}")
     
     return audio_tensor, TARGET_SAMPLE_RATE
 
