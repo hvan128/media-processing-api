@@ -12,6 +12,8 @@ faster-whisper==1.0.0
 
 # Vocal separation (Spleeter)
 # Spleeter is faster on CPU than Demucs (~10s for 1min audio)
+# Pin typer<0.10.0 for compatibility (spleeter imports from typer.models which changed in typer>=0.10.0)
+typer<0.10.0
 spleeter==2.4.0
 
 # Utilities
