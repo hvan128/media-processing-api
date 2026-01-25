@@ -30,9 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 # Demucs configuration
-# Using htdemucs with 2 stems for faster processing
-MODEL_NAME = "htdemucs"
+# Using lightweight "demucs" model (NOT htdemucs) for CPU speed
+# 2-stem separation (vocals/no_vocals) for faster processing
+MODEL_NAME = "demucs"
 DEVICE = "cpu"
+# Target sample rate for CPU optimization (16kHz is faster, 22kHz is better quality)
+TARGET_SAMPLE_RATE = 16000
 
 # Global model instance and apply function
 _separator = None
@@ -95,6 +98,10 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     """
     Load audio file using FFmpeg and convert to torch tensor (SYNCHRONOUS).
     
+    OPTIMIZED for CPU speed:
+    - Converts to MONO (1 channel) to reduce processing
+    - Resamples to 16kHz (or TARGET_SAMPLE_RATE) for faster inference
+    
     This is a blocking operation that must run in an executor.
     Uses subprocess.run (not asyncio) to avoid blocking the event loop.
     
@@ -103,19 +110,21 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     
     Returns:
         Tuple of (audio_tensor, sample_rate)
-        audio_tensor: Shape (channels, samples) as float32 tensor
-        sample_rate: Sample rate in Hz
+        audio_tensor: Shape (1, samples) as float32 tensor (mono)
+        sample_rate: Sample rate in Hz (TARGET_SAMPLE_RATE)
     """
-    logger.info(f"Loading audio with FFmpeg (sync): {audio_path}")
+    logger.info(f"Loading audio with FFmpeg (sync, optimized for CPU): {audio_path}")
     
-    # Use FFmpeg to decode audio to raw PCM (16-bit signed little-endian)
-    # Output format: -f s16le = signed 16-bit little-endian PCM
+    # Use FFmpeg to decode and preprocess audio:
+    # - Convert to MONO (1 channel) for faster processing
+    # - Resample to TARGET_SAMPLE_RATE (16kHz) for speed
+    # - Output as raw PCM (16-bit signed little-endian)
     cmd = [
         "ffmpeg", "-i", str(audio_path),
         "-f", "s16le",  # Raw PCM format
         "-acodec", "pcm_s16le",
-        "-ar", "44100",  # Resample to 44.1kHz (Demucs standard)
-        "-ac", "2",  # Convert to stereo (2 channels)
+        "-ar", str(TARGET_SAMPLE_RATE),  # Resample to target rate (16kHz)
+        "-ac", "1",  # Convert to MONO (1 channel) for speed
         "-"  # Output to stdout
     ]
     
@@ -135,20 +144,16 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     # s16le = signed 16-bit little-endian, so we use int16
     audio_data = np.frombuffer(result.stdout, dtype=np.int16)
     
-    # Reshape to (channels, samples)
-    # We specified 2 channels, so reshape accordingly
-    num_channels = 2
-    num_samples = len(audio_data) // num_channels
-    audio_data = audio_data[:num_samples * num_channels].reshape(num_channels, num_samples)
+    # Reshape to (1, samples) for mono
+    # Add channel dimension: (samples,) -> (1, samples)
+    audio_data = audio_data.reshape(1, -1)
     
     # Convert to float32 and normalize to [-1.0, 1.0]
     audio_tensor = torch.from_numpy(audio_data.astype(np.float32) / 32768.0)
     
-    sample_rate = 44100  # We resampled to 44.1kHz
+    logger.info(f"Loaded audio (mono, {TARGET_SAMPLE_RATE}Hz): shape={audio_tensor.shape}, sample_rate={TARGET_SAMPLE_RATE}")
     
-    logger.info(f"Loaded audio: shape={audio_tensor.shape}, sample_rate={sample_rate}")
-    
-    return audio_tensor, sample_rate
+    return audio_tensor, TARGET_SAMPLE_RATE
 
 
 def _save_audio_with_ffmpeg_sync(audio_tensor: torch.Tensor, sample_rate: int, output_path: Path) -> None:
@@ -250,32 +255,51 @@ def _run_demucs_library_sync(audio_path: Path, output_dir: Path) -> Path:
     logger.info(f"Running Demucs inference on audio shape: {audio_batch.shape}")
     
     # Step 4: Run Demucs inference (CPU-bound, blocking)
-    # Use full separation and combine non-vocal sources to get no_vocals
-    # This avoids needing two_stems parameter which may not be available in apply_model
+    # OPTIMIZED for speed:
+    # - Try 2-stem separation first (faster than 4-stem)
+    # - No shifts (shifts=0) for maximum speed
+    # - Minimal overlap for faster processing
     with torch.no_grad():
-        sources = apply_model(
-            model,
-            audio_batch,
-            device=DEVICE,
-            shifts=1,  # Number of random shifts for better quality
-            split=True,  # Split long audio into chunks
-            overlap=0.25,  # Overlap between chunks
-            progress=False
-        )
-        
-        # Sources shape: (batch, sources, channels, samples)
-        # For htdemucs, sources order is typically: [drums, bass, other, vocals]
-        # no_vocals = drums + bass + other (everything except vocals)
-        if sources.shape[1] == 4:
-            # Standard 4-source separation: drums, bass, other, vocals
-            no_vocals = sources[0, 0:3].sum(dim=0)  # Sum drums, bass, other
-        elif sources.shape[1] == 2:
-            # Two-stem separation: assume index 1 is no_vocals
-            no_vocals = sources[0, 1]
-        else:
-            # Fallback: sum all sources except the last (assuming last is vocals)
-            logger.warning(f"Unexpected number of sources: {sources.shape[1]}, using fallback")
-            no_vocals = sources[0, :-1].sum(dim=0)
+        # Try 2-stem separation first (vocals/no_vocals) - much faster
+        try:
+            sources = apply_model(
+                model,
+                audio_batch,
+                device=DEVICE,
+                shifts=0,  # No shifts for speed (was 1)
+                split=True,  # Split long audio into chunks
+                overlap=0.1,  # Reduced overlap for speed (was 0.25)
+                progress=False,
+                two_stems="vocals"  # Use 2-stem separation (vocals/no_vocals)
+            )
+            # For 2-stem separation, sources shape: (batch, 2, channels, samples)
+            # Order: [vocals, no_vocals] or [no_vocals, vocals]
+            # Typically index 1 is no_vocals
+            if sources.shape[1] == 2:
+                no_vocals = sources[0, 1]  # Index 1 is no_vocals
+                logger.info("Using 2-stem separation (vocals/no_vocals)")
+            else:
+                raise ValueError(f"Expected 2 stems, got {sources.shape[1]}")
+        except (TypeError, ValueError) as e:
+            # Fallback to full separation if two_stems not supported
+            logger.warning(f"2-stem separation not available, using full separation: {e}")
+            sources = apply_model(
+                model,
+                audio_batch,
+                device=DEVICE,
+                shifts=0,  # No shifts for speed
+                split=True,
+                overlap=0.1,  # Reduced overlap for speed
+                progress=False
+            )
+            # For full separation, sources order: [drums, bass, other, vocals]
+            # no_vocals = drums + bass + other
+            if sources.shape[1] == 4:
+                no_vocals = sources[0, 0:3].sum(dim=0)  # Sum drums, bass, other
+            else:
+                # Fallback: sum all sources except the last (assuming last is vocals)
+                logger.warning(f"Unexpected number of sources: {sources.shape[1]}, using fallback")
+                no_vocals = sources[0, :-1].sum(dim=0)
     
     logger.info(f"Demucs inference completed. no_vocals shape: {no_vocals.shape}")
     
