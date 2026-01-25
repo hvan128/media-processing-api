@@ -146,7 +146,14 @@ class JobManager:
         return job
     
     async def get_job(self, job_id: str) -> Optional[Job]:
-        """Retrieve job by ID"""
+        """
+        Retrieve job by ID.
+        
+        This is a pure read operation that MUST return immediately (<10ms).
+        Lock is held only for the minimal time needed to access the dict.
+        Since asyncio is single-threaded, we can safely return the job reference.
+        """
+        # Hold lock only for dict lookup - this is extremely fast
         async with self._lock:
             return self._jobs.get(job_id)
     
@@ -154,10 +161,16 @@ class JobManager:
         """
         Update job progress (0-100).
         Called by handlers during processing to report progress.
+        
+        Lock is held only for the minimal time needed to update progress.
         """
+        # Clamp progress value
+        progress = min(100, max(0, progress))
+        
+        # Hold lock only for the update operation
         async with self._lock:
             if job_id in self._jobs:
-                self._jobs[job_id].progress = min(100, max(0, progress))
+                self._jobs[job_id].progress = progress
     
     async def start(self):
         """Start the job worker and cleanup tasks"""
@@ -185,6 +198,10 @@ class JobManager:
         Processes one job at a time from the queue.
         This is critical for CPU/memory-constrained environments
         where running multiple heavy jobs simultaneously would cause OOM.
+        
+        IMPORTANT: Lock is held ONLY for brief state updates.
+        Handler execution happens WITHOUT lock to ensure GET requests
+        never block waiting for job completion.
         """
         while self._running:
             try:
@@ -194,41 +211,53 @@ class JobManager:
                 except asyncio.TimeoutError:
                     continue
                 
-                # Get job and handler
-                job = await self.get_job(job_id)
-                if not job:
-                    continue
+                # Get job directly from dict (worker is the only writer, safe to read)
+                # Hold lock only for the minimal time needed to get job reference
+                async with self._lock:
+                    job = self._jobs.get(job_id)
+                    if not job:
+                        self._queue.task_done()
+                        continue
                 
+                # Get handler (no lock needed - handlers are read-only)
                 handler = self._handlers.get(job.job_type)
                 if not handler:
+                    # Update status to error (brief lock)
                     async with self._lock:
-                        job.status = JobStatus.ERROR
-                        job.error_message = f"No handler for job type: {job.job_type}"
-                        job.completed_at = datetime.utcnow()
+                        if job_id in self._jobs:
+                            self._jobs[job_id].status = JobStatus.ERROR
+                            self._jobs[job_id].error_message = f"No handler for job type: {job.job_type}"
+                            self._jobs[job_id].completed_at = datetime.utcnow()
+                    self._queue.task_done()
                     continue
                 
-                # Update status to running
+                # Update status to running (brief lock, then release)
                 async with self._lock:
-                    job.status = JobStatus.RUNNING
-                    job.progress = 0
+                    if job_id in self._jobs:
+                        self._jobs[job_id].status = JobStatus.RUNNING
+                        self._jobs[job_id].progress = 0
                 
+                # CRITICAL: Execute handler WITHOUT lock
+                # This ensures GET requests can always read job state
+                # even while heavy processing (Demucs, Whisper) is running
                 try:
-                    # Execute the handler
                     result = await handler(job, self)
                     
-                    # Mark as done
+                    # Mark as done (brief lock)
                     async with self._lock:
-                        job.status = JobStatus.DONE
-                        job.progress = 100
-                        job.result = result
-                        job.completed_at = datetime.utcnow()
+                        if job_id in self._jobs:
+                            self._jobs[job_id].status = JobStatus.DONE
+                            self._jobs[job_id].progress = 100
+                            self._jobs[job_id].result = result
+                            self._jobs[job_id].completed_at = datetime.utcnow()
                     
                 except Exception as e:
-                    # Mark as error
+                    # Mark as error (brief lock)
                     async with self._lock:
-                        job.status = JobStatus.ERROR
-                        job.error_message = str(e)
-                        job.completed_at = datetime.utcnow()
+                        if job_id in self._jobs:
+                            self._jobs[job_id].status = JobStatus.ERROR
+                            self._jobs[job_id].error_message = str(e)
+                            self._jobs[job_id].completed_at = datetime.utcnow()
                     
                     # Cleanup work directory on error
                     if job.work_dir and job.work_dir.exists():
