@@ -16,25 +16,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Install system dependencies
 # - ffmpeg: Audio/video processing (runtime)
-# - libavformat-dev, etc.: FFmpeg dev libraries for building PyAV
 # - libsndfile1: Audio file reading (for Spleeter)
 # - libgomp: OpenMP library required by CTranslate2 (faster-whisper)
-# - pkg-config, gcc, python3-dev: Required for building PyAV
 # - curl: Health checks
+# Note: No FFmpeg dev libs needed - using pre-built PyAV wheel
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    libavformat-dev \
-    libavcodec-dev \
-    libavdevice-dev \
-    libavutil-dev \
-    libswscale-dev \
-    libswresample-dev \
-    libavfilter-dev \
     libsndfile1 \
     libgomp1 \
-    pkg-config \
-    gcc \
-    python3-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -53,8 +42,13 @@ RUN pip install "numpy<2.0.0"
 # Install Spleeter (uses TensorFlow, CPU-only by default)
 RUN pip install spleeter==2.4.0
 
-# Install faster-whisper with dependencies
-RUN pip install faster-whisper==1.0.0
+# Install PyAV from pre-built wheel (avoid building from source)
+# av>=12 has wheels compatible with manylinux
+RUN pip install av>=12.0.0 --only-binary :all:
+
+# Install faster-whisper (skip av since we installed it above)
+RUN pip install faster-whisper==1.0.0 --no-deps && \
+    pip install ctranslate2 huggingface_hub tokenizers onnxruntime
 
 # Install FastAPI and other dependencies
 RUN pip install fastapi==0.109.0 uvicorn[standard]==0.27.0 \
