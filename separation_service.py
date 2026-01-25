@@ -41,6 +41,7 @@ TARGET_SAMPLE_RATE = 16000
 _separator = None
 _apply_model = None
 _model_loaded = False
+_model_loading_error = None
 
 
 def load_model():
@@ -49,7 +50,7 @@ def load_model():
     
     Loads Demucs model as a library (not CLI) to avoid torchaudio.save() calls.
     """
-    global _model_loaded, _separator, _apply_model
+    global _model_loaded, _separator, _apply_model, _model_loading_error
     
     if _model_loaded:
         return
@@ -73,10 +74,13 @@ def load_model():
         _apply_model = apply_model
         
         _model_loaded = True
+        _model_loading_error = None  # Clear any previous error
         print("Demucs model loaded successfully (library mode)")
         
     except Exception as e:
-        print(f"Error loading Demucs model: {e}")
+        error_msg = f"Error loading Demucs model: {e}"
+        print(error_msg)
+        _model_loading_error = str(e)
         raise
 
 
@@ -342,11 +346,35 @@ def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) ->
     import time
     max_wait = 120
     start_time = time.time()
+    wait_interval = 2  # Check every 2 seconds
+    last_log_time = 0
+    
     while not _model_loaded and (time.time() - start_time) < max_wait:
-        time.sleep(1)
+        elapsed = time.time() - start_time
+        
+        # Log progress every 10 seconds
+        if elapsed - last_log_time >= 10:
+            logger.info(f"Waiting for Demucs model to load... ({int(elapsed)}s elapsed)")
+            last_log_time = elapsed
+        
+        # Check if model loading failed
+        if _model_loading_error:
+            raise RuntimeError(
+                f"Demucs model failed to load: {_model_loading_error}. "
+                f"Please check server logs and restart the service."
+            )
+        
+        time.sleep(wait_interval)
     
     if not _model_loaded:
-        raise RuntimeError("Demucs model is not ready. Please try again in a moment.")
+        error_msg = "Demucs model is not ready after waiting 120 seconds."
+        if _model_loading_error:
+            error_msg += f" Loading error: {_model_loading_error}"
+        else:
+            error_msg += " Model may still be loading. Please try again in a moment."
+        raise RuntimeError(error_msg)
+    
+    logger.info("Demucs model is ready, proceeding with separation")
     
     # Create a subdirectory for Demucs output
     demucs_output_dir = job.work_dir / "demucs_output"
