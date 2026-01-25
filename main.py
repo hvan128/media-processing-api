@@ -80,35 +80,21 @@ class JobStatusResponse(BaseModel):
 # Application Lifecycle
 # ====================
 
-# Track model loading status for health checks
-_models_loading = True
-_models_ready = False
 
-async def _load_models_background():
+def _load_all_models_sync():
     """
-    Load ML models in the background.
+    Load ALL ML models synchronously (blocking).
     
-    This allows the FastAPI server to start immediately and respond to
-    health checks while models are still loading. This is critical for
-    CI/CD deployments where health checks must pass within a reasonable
-    time window, even though model loading can take 30-90 seconds.
+    This function is meant to be called in an executor during startup.
+    It blocks until all models are loaded, ensuring no race conditions.
     """
-    global _models_loading, _models_ready
+    print("Loading Whisper model...")
+    load_whisper_model()
     
-    try:
-        print("Loading Whisper model...")
-        load_whisper_model()
-        
-        print("Loading Demucs model...")
-        load_demucs_model()
-        
-        _models_ready = True
-        print("All models loaded successfully!")
-    except Exception as e:
-        print(f"Error loading models: {e}")
-        raise
-    finally:
-        _models_loading = False
+    print("Loading Demucs model...")
+    load_demucs_model()
+    
+    print("All models loaded successfully!")
 
 
 @asynccontextmanager
@@ -117,35 +103,37 @@ async def lifespan(app: FastAPI):
     Application lifecycle manager.
     
     Startup:
-    - Start job worker and register handlers (non-blocking)
-    - Load ML models in background (allows server to start immediately)
+    - Load ML models FIRST (blocking, in executor)
+    - Start job worker and register handlers
     
     Shutdown:
     - Stop job worker gracefully
     
-    Note: Model loading happens asynchronously to allow health checks
-    to pass immediately. The server is ready to accept requests as soon
-    as the worker starts, even if models are still loading.
+    IMPORTANT: Models are loaded synchronously during startup.
+    The API will NOT accept requests until models are ready.
+    This eliminates race conditions between startup and job execution.
     """
     import asyncio
     
     # Startup
     print("Starting Media Processing API...")
     
-    # Register job handlers (doesn't require models to be loaded)
+    # Step 1: Load ALL models FIRST (blocking, in executor)
+    # This runs in a thread pool to avoid blocking the event loop completely
+    # but we AWAIT it to ensure models are ready before accepting requests
+    print("Loading ML models (this may take 30-90 seconds)...")
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _load_all_models_sync)
+    
+    # Step 2: Register job handlers (models are now guaranteed to be loaded)
     job_manager.register_handler(JobType.STT, process_stt)
     job_manager.register_handler(JobType.SEPARATE, process_separation)
     job_manager.register_handler(JobType.MERGE, process_merge)
     
-    # Start job worker (non-blocking, allows server to start immediately)
+    # Step 3: Start job worker
     await job_manager.start()
     
-    # Load models in background task (non-blocking)
-    # This allows the server to start accepting requests immediately
-    # while models load in the background (takes 30-90 seconds)
-    asyncio.create_task(_load_models_background())
-    
-    print("API server ready! (Models loading in background...)")
+    print("API server ready! All models loaded.")
     
     yield
     

@@ -138,16 +138,13 @@ async def process_stt(job: Job, manager: JobManager) -> dict:
     await manager.update_progress(job.job_id, 20)
     
     # Step 2: Run transcription
-    # Wait for model to be ready (models load in background during startup)
-    # Models can take 30-90 seconds to load, so we wait up to 120 seconds
-    import time
-    max_wait = 120
-    start_time = time.time()
-    while _model is None and (time.time() - start_time) < max_wait:
-        await asyncio.sleep(1)
-    
+    # Model is guaranteed to be loaded during FastAPI startup (blocking)
+    # No waiting/polling needed here
     if _model is None:
-        raise RuntimeError("Whisper model is not ready. Please try again in a moment.")
+        raise RuntimeError(
+            "Whisper model is not loaded. This should not happen - "
+            "models are loaded during startup before accepting requests."
+        )
     
     model = get_model()
     

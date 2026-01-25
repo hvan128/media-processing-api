@@ -345,40 +345,13 @@ def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) ->
     """
     logger.info(f"Processing separation job {job.job_id} (sync)")
     
-    # Wait for model to be ready (models load in background during startup)
-    # Models can take 30-90 seconds to load, so we wait up to 120 seconds
-    import time
-    max_wait = 120
-    start_time = time.time()
-    wait_interval = 2  # Check every 2 seconds
-    last_log_time = 0
-    
-    while not _model_loaded and (time.time() - start_time) < max_wait:
-        elapsed = time.time() - start_time
-        
-        # Log progress every 10 seconds
-        if elapsed - last_log_time >= 10:
-            logger.info(f"Waiting for Demucs model to load... ({int(elapsed)}s elapsed)")
-            last_log_time = elapsed
-        
-        # Check if model loading failed
-        if _model_loading_error:
-            raise RuntimeError(
-                f"Demucs model failed to load: {_model_loading_error}. "
-                f"Please check server logs and restart the service."
-            )
-        
-        time.sleep(wait_interval)
-    
+    # Model is guaranteed to be loaded during FastAPI startup (blocking)
+    # No waiting/polling needed here - if model isn't loaded, it's a fatal error
     if not _model_loaded:
-        error_msg = "Demucs model is not ready after waiting 120 seconds."
-        if _model_loading_error:
-            error_msg += f" Loading error: {_model_loading_error}"
-        else:
-            error_msg += " Model may still be loading. Please try again in a moment."
-        raise RuntimeError(error_msg)
-    
-    logger.info("Demucs model is ready, proceeding with separation")
+        raise RuntimeError(
+            "Demucs model is not loaded. This should not happen - "
+            "models are loaded during startup before accepting requests."
+        )
     
     # Create a subdirectory for Demucs output
     demucs_output_dir = job.work_dir / "demucs_output"
