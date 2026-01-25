@@ -91,11 +91,12 @@ def get_apply_model():
     return _apply_model
 
 
-async def load_audio_with_ffmpeg(audio_path: Path) -> Tuple[torch.Tensor, int]:
+def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     """
-    Load audio file using FFmpeg and convert to torch tensor.
+    Load audio file using FFmpeg and convert to torch tensor (SYNCHRONOUS).
     
-    This bypasses torchaudio entirely and uses FFmpeg to decode audio.
+    This is a blocking operation that must run in an executor.
+    Uses subprocess.run (not asyncio) to avoid blocking the event loop.
     
     Args:
         audio_path: Path to input audio file (any format)
@@ -105,7 +106,7 @@ async def load_audio_with_ffmpeg(audio_path: Path) -> Tuple[torch.Tensor, int]:
         audio_tensor: Shape (channels, samples) as float32 tensor
         sample_rate: Sample rate in Hz
     """
-    logger.info(f"Loading audio with FFmpeg: {audio_path}")
+    logger.info(f"Loading audio with FFmpeg (sync): {audio_path}")
     
     # Use FFmpeg to decode audio to raw PCM (16-bit signed little-endian)
     # Output format: -f s16le = signed 16-bit little-endian PCM
@@ -118,21 +119,21 @@ async def load_audio_with_ffmpeg(audio_path: Path) -> Tuple[torch.Tensor, int]:
         "-"  # Output to stdout
     ]
     
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+    # Use subprocess.run (blocking, but runs in executor thread)
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False
     )
     
-    stdout, stderr = await process.communicate()
-    
-    if process.returncode != 0:
-        error_msg = stderr.decode() if stderr else "Unknown error"
+    if result.returncode != 0:
+        error_msg = result.stderr.decode() if result.stderr else "Unknown error"
         raise RuntimeError(f"FFmpeg audio loading failed: {error_msg}")
     
     # Convert raw PCM bytes to numpy array
     # s16le = signed 16-bit little-endian, so we use int16
-    audio_data = np.frombuffer(stdout, dtype=np.int16)
+    audio_data = np.frombuffer(result.stdout, dtype=np.int16)
     
     # Reshape to (channels, samples)
     # We specified 2 channels, so reshape accordingly
@@ -150,18 +151,19 @@ async def load_audio_with_ffmpeg(audio_path: Path) -> Tuple[torch.Tensor, int]:
     return audio_tensor, sample_rate
 
 
-async def save_audio_with_ffmpeg(audio_tensor: torch.Tensor, sample_rate: int, output_path: Path) -> None:
+def _save_audio_with_ffmpeg_sync(audio_tensor: torch.Tensor, sample_rate: int, output_path: Path) -> None:
     """
-    Save audio tensor to WAV file using FFmpeg.
+    Save audio tensor to WAV file using FFmpeg (SYNCHRONOUS).
     
-    This bypasses torchaudio entirely and uses FFmpeg to encode audio.
+    This is a blocking operation that must run in an executor.
+    Uses subprocess.run (not asyncio) to avoid blocking the event loop.
     
     Args:
         audio_tensor: Audio tensor with shape (channels, samples) as float32
         sample_rate: Sample rate in Hz
         output_path: Path to output WAV file
     """
-    logger.info(f"Saving audio with FFmpeg: {output_path}, shape={audio_tensor.shape}, sr={sample_rate}")
+    logger.info(f"Saving audio with FFmpeg (sync): {output_path}, shape={audio_tensor.shape}, sr={sample_rate}")
     
     # Ensure output directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -189,17 +191,17 @@ async def save_audio_with_ffmpeg(audio_tensor: torch.Tensor, sample_rate: int, o
         str(output_path)
     ]
     
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+    # Use subprocess.run (blocking, but runs in executor thread)
+    result = subprocess.run(
+        cmd,
+        input=audio_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False
     )
     
-    stdout, stderr = await process.communicate(input=audio_bytes)
-    
-    if process.returncode != 0:
-        error_msg = stderr.decode() if stderr else "Unknown error"
+    if result.returncode != 0:
+        error_msg = result.stderr.decode() if result.stderr else "Unknown error"
         raise RuntimeError(f"FFmpeg audio saving failed: {error_msg}")
     
     if not output_path.exists():
@@ -208,15 +210,18 @@ async def save_audio_with_ffmpeg(audio_tensor: torch.Tensor, sample_rate: int, o
     logger.info(f"Successfully saved audio: {output_path}")
 
 
-async def run_demucs_library(audio_path: Path, output_dir: Path) -> Path:
+def _run_demucs_library_sync(audio_path: Path, output_dir: Path) -> Path:
     """
-    Run Demucs separation using the library API (NOT CLI).
+    Run Demucs separation using the library API (SYNCHRONOUS).
+    
+    This is a blocking operation that must run in an executor.
+    Contains ALL CPU-bound work: FFmpeg, Demucs inference, torch operations.
     
     This avoids torchaudio.save() calls entirely by:
-    1. Loading audio with FFmpeg
+    1. Loading audio with FFmpeg (sync)
     2. Running Demucs inference in memory
     3. Extracting no_vocals source
-    4. Saving with FFmpeg
+    4. Saving with FFmpeg (sync)
     
     Args:
         audio_path: Path to input audio file
@@ -228,10 +233,10 @@ async def run_demucs_library(audio_path: Path, output_dir: Path) -> Path:
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    logger.info(f"Running Demucs separation (library mode) on: {audio_path}")
+    logger.info(f"Running Demucs separation (sync, library mode) on: {audio_path}")
     
-    # Step 1: Load audio using FFmpeg (no torchaudio)
-    audio_tensor, sample_rate = await load_audio_with_ffmpeg(audio_path)
+    # Step 1: Load audio using FFmpeg (synchronous, blocking)
+    audio_tensor, sample_rate = _load_audio_with_ffmpeg_sync(audio_path)
     
     # Step 2: Get model and apply function
     model = get_model()
@@ -244,7 +249,7 @@ async def run_demucs_library(audio_path: Path, output_dir: Path) -> Path:
     
     logger.info(f"Running Demucs inference on audio shape: {audio_batch.shape}")
     
-    # Step 4: Run Demucs inference
+    # Step 4: Run Demucs inference (CPU-bound, blocking)
     # Use full separation and combine non-vocal sources to get no_vocals
     # This avoids needing two_stems parameter which may not be available in apply_model
     with torch.no_grad():
@@ -274,9 +279,9 @@ async def run_demucs_library(audio_path: Path, output_dir: Path) -> Path:
     
     logger.info(f"Demucs inference completed. no_vocals shape: {no_vocals.shape}")
     
-    # Step 5: Save no_vocals using FFmpeg (no torchaudio)
+    # Step 5: Save no_vocals using FFmpeg (synchronous, blocking)
     output_path = output_dir / "no_vocals.wav"
-    await save_audio_with_ffmpeg(no_vocals, sample_rate, output_path)
+    _save_audio_with_ffmpeg_sync(no_vocals, sample_rate, output_path)
     
     if not output_path.exists():
         raise RuntimeError(f"Output file not found after saving: {output_path}")
@@ -286,14 +291,81 @@ async def run_demucs_library(audio_path: Path, output_dir: Path) -> Path:
     return output_path
 
 
+def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) -> dict:
+    """
+    Process a vocal separation job (SYNCHRONOUS, blocking).
+    
+    This function contains ALL CPU-bound and blocking operations:
+    - Demucs inference (torch operations)
+    - FFmpeg audio loading/saving
+    - File I/O operations
+    
+    This MUST run in an executor to avoid blocking the event loop.
+    Progress updates are handled by the async wrapper, not here.
+    
+    Args:
+        job: Job instance with params
+        manager: JobManager instance (for cleanup, not progress updates)
+        audio_path: Path to downloaded audio file
+    
+    Returns:
+        dict with 'file_url' pointing to the no_vocals audio file
+    """
+    logger.info(f"Processing separation job {job.job_id} (sync)")
+    
+    # Wait for model to be ready (models load in background during startup)
+    # Models can take 30-90 seconds to load, so we wait up to 120 seconds
+    import time
+    max_wait = 120
+    start_time = time.time()
+    while not _model_loaded and (time.time() - start_time) < max_wait:
+        time.sleep(1)
+    
+    if not _model_loaded:
+        raise RuntimeError("Demucs model is not ready. Please try again in a moment.")
+    
+    # Create a subdirectory for Demucs output
+    demucs_output_dir = job.work_dir / "demucs_output"
+    demucs_output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Demucs output directory: {demucs_output_dir}")
+    
+    # Run separation using library (synchronous, blocking)
+    # This contains ALL CPU-bound work: FFmpeg, Demucs inference, torch
+    logger.info("Starting Demucs separation process (sync, library mode)")
+    no_vocals_path = _run_demucs_library_sync(audio_path, demucs_output_dir)
+    logger.info(f"Demucs separation completed. Output: {no_vocals_path}")
+    
+    # Copy to output directory (blocking file I/O)
+    output_filename = f"{job.job_id}_no_vocals.wav"
+    output_path = manager.output_dir / output_filename
+    
+    logger.info(f"Copying output to: {output_path}")
+    shutil.copy2(no_vocals_path, output_path)
+    
+    if not output_path.exists():
+        raise RuntimeError(f"Failed to copy output file to {output_path}")
+    
+    logger.info(f"Separation job {job.job_id} completed successfully")
+    
+    # Cleanup working directory
+    manager.cleanup_job_work_dir(job)
+    
+    return {
+        "file_url": f"/static/{output_filename}"
+    }
+
+
 async def process_separation(job: Job, manager: JobManager) -> dict:
     """
-    Process a vocal separation job.
+    Process a vocal separation job (ASYNC wrapper).
+    
+    This function schedules blocking work in an executor to keep the event loop responsive.
+    Only I/O operations (download) remain async. All CPU-bound work runs in executor.
     
     Steps:
-    1. Download audio file (0-20% progress)
-    2. Run Demucs separation (20-90% progress)
-    3. Copy output to static directory (90-100% progress)
+    1. Download audio file (async I/O, 0-20% progress)
+    2. Schedule Demucs separation in executor (20-90% progress)
+    3. Copy output to static directory (in executor, 90-100% progress)
     
     Args:
         job: Job instance with params:
@@ -308,7 +380,7 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     params = job.params
     media_url = params["media_url"]
     
-    # Step 1: Download audio file
+    # Step 1: Download audio file (async I/O - this is fine, doesn't block CPU)
     await manager.update_progress(job.job_id, 5)
     logger.info(f"Downloading audio from: {media_url}")
     
@@ -321,50 +393,28 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     logger.info(f"Audio downloaded to: {audio_path}")
     await manager.update_progress(job.job_id, 20)
     
-    # Step 2: Run Demucs separation (library mode, no CLI)
-    # Wait for model to be ready (models load in background during startup)
-    # Models can take 30-90 seconds to load, so we wait up to 120 seconds
-    import time
-    max_wait = 120
-    start_time = time.time()
-    while not _model_loaded and (time.time() - start_time) < max_wait:
-        await asyncio.sleep(1)
+    # Step 2: Schedule ALL blocking work in executor
+    # This includes: Demucs inference, FFmpeg operations, file I/O
+    # The event loop remains responsive while this runs in a thread
+    loop = asyncio.get_running_loop()
     
-    if not _model_loaded:
-        raise RuntimeError("Demucs model is not ready. Please try again in a moment.")
-    
-    # Create a subdirectory for Demucs output
-    demucs_output_dir = job.work_dir / "demucs_output"
-    demucs_output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Demucs output directory: {demucs_output_dir}")
-    
-    # Demucs doesn't provide progress callbacks easily,
-    # so we'll update progress in steps
     await manager.update_progress(job.job_id, 30)
     
-    # Run separation using library (NOT CLI - avoids torchaudio.save())
-    logger.info("Starting Demucs separation process (library mode)")
-    no_vocals_path = await run_demucs_library(audio_path, demucs_output_dir)
-    logger.info(f"Demucs separation completed. Output: {no_vocals_path}")
+    logger.info("Scheduling blocking separation work in executor")
     
-    await manager.update_progress(job.job_id, 90)
+    # Run blocking work in executor (default ThreadPoolExecutor)
+    # This immediately yields control back to the event loop
+    result = await loop.run_in_executor(
+        None,  # Use default ThreadPoolExecutor
+        _process_separation_sync,
+        job,
+        manager,
+        audio_path
+    )
     
-    # Step 3: Copy to output directory
-    output_filename = f"{job.job_id}_no_vocals.wav"
-    output_path = manager.output_dir / output_filename
-    
-    logger.info(f"Copying output to: {output_path}")
-    shutil.copy2(no_vocals_path, output_path)
-    
-    if not output_path.exists():
-        raise RuntimeError(f"Failed to copy output file to {output_path}")
-    
-    logger.info(f"Separation job {job.job_id} completed successfully")
+    # Update progress after executor completes
     await manager.update_progress(job.job_id, 100)
     
-    # Cleanup working directory
-    manager.cleanup_job_work_dir(job)
+    logger.info(f"Separation job {job.job_id} completed")
     
-    return {
-        "file_url": f"/static/{output_filename}"
-    }
+    return result
