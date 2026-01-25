@@ -30,10 +30,11 @@ logger = logging.getLogger(__name__)
 
 
 # Demucs configuration
-# Using classic "demucs" model - NOT htdemucs or htdemucs_ft (transformers are too slow on CPU)
+# Using "demucs_quantized" - CPU-optimized quantized CNN model
+# NOT htdemucs or htdemucs_ft (transformers are too slow on CPU)
 # Full 4-stem separation, then compute no_vocals = drums + bass + other
 # Optimized for CPU: mono input, 16kHz sample rate, no shifts, no overlap
-MODEL_NAME = "demucs"
+MODEL_NAME = "demucs_quantized"
 DEVICE = "cpu"
 # Target sample rate for CPU optimization (16kHz for speed)
 TARGET_SAMPLE_RATE = 16000
