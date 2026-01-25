@@ -104,8 +104,9 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     Load audio file using FFmpeg and convert to torch tensor (SYNCHRONOUS).
     
     OPTIMIZED for CPU speed:
-    - Converts to MONO (1 channel) to reduce processing
+    - Keeps STEREO (2 channels) - required by Demucs model architecture
     - Resamples to 16kHz (or TARGET_SAMPLE_RATE) for faster inference
+    - Sample rate reduction provides ~2.75x speedup vs 44.1kHz
     
     This is a blocking operation that must run in an executor.
     Uses subprocess.run (not asyncio) to avoid blocking the event loop.
@@ -115,13 +116,13 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     
     Returns:
         Tuple of (audio_tensor, sample_rate)
-        audio_tensor: Shape (1, samples) as float32 tensor (mono)
+        audio_tensor: Shape (2, samples) as float32 tensor (stereo)
         sample_rate: Sample rate in Hz (TARGET_SAMPLE_RATE)
     """
     logger.info(f"Loading audio with FFmpeg (sync, optimized for CPU): {audio_path}")
     
     # Use FFmpeg to decode and preprocess audio:
-    # - Convert to MONO (1 channel) for faster processing
+    # - Keep STEREO (2 channels) - Demucs model requires stereo input
     # - Resample to TARGET_SAMPLE_RATE (16kHz) for speed
     # - Output as raw PCM (16-bit signed little-endian)
     cmd = [
@@ -129,7 +130,7 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
         "-f", "s16le",  # Raw PCM format
         "-acodec", "pcm_s16le",
         "-ar", str(TARGET_SAMPLE_RATE),  # Resample to target rate (16kHz)
-        "-ac", "1",  # Convert to MONO (1 channel) for speed
+        "-ac", "2",  # Keep STEREO (2 channels) - required by Demucs
         "-"  # Output to stdout
     ]
     
@@ -149,14 +150,16 @@ def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
     # s16le = signed 16-bit little-endian, so we use int16
     audio_data = np.frombuffer(result.stdout, dtype=np.int16)
     
-    # Reshape to (1, samples) for mono
-    # Add channel dimension: (samples,) -> (1, samples)
-    audio_data = audio_data.reshape(1, -1)
+    # Reshape to (2, samples) for stereo
+    # We specified 2 channels, so reshape accordingly
+    num_channels = 2
+    num_samples = len(audio_data) // num_channels
+    audio_data = audio_data[:num_samples * num_channels].reshape(num_channels, num_samples)
     
     # Convert to float32 and normalize to [-1.0, 1.0]
     audio_tensor = torch.from_numpy(audio_data.astype(np.float32) / 32768.0)
     
-    logger.info(f"Loaded audio (mono, {TARGET_SAMPLE_RATE}Hz): shape={audio_tensor.shape}, sample_rate={TARGET_SAMPLE_RATE}")
+    logger.info(f"Loaded audio (stereo, {TARGET_SAMPLE_RATE}Hz): shape={audio_tensor.shape}, sample_rate={TARGET_SAMPLE_RATE}")
     
     return audio_tensor, TARGET_SAMPLE_RATE
 
