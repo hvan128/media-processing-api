@@ -30,9 +30,10 @@ logger = logging.getLogger(__name__)
 
 
 # Demucs configuration
-# Using lightweight "demucs" model (NOT htdemucs) for CPU speed
+# Using htdemucs_ft (fine-tuned) which is optimized and supports 2-stem separation
+# Combined with audio preprocessing (mono + 16kHz) for maximum CPU speed
 # 2-stem separation (vocals/no_vocals) for faster processing
-MODEL_NAME = "demucs"
+MODEL_NAME = "htdemucs_ft"
 DEVICE = "cpu"
 # Target sample rate for CPU optimization (16kHz is faster, 22kHz is better quality)
 TARGET_SAMPLE_RATE = 16000
