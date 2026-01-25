@@ -1,26 +1,24 @@
 """
 Vocal Separation Service Module
 ===============================
-Handles vocal separation using Demucs.
+Handles vocal separation using Spleeter.
 
 Design Decisions:
-- Uses htdemucs model with 2-stem separation (vocals/no_vocals)
-- Model loaded once at startup to avoid repeated loading
-- CPU-only operation with optimized parameters
-- Only returns no_vocals track as per requirements
-- Uses Demucs as a LIBRARY (not CLI) to avoid torchaudio.save() calls
-- Uses FFmpeg for audio loading and saving to avoid torchaudio backends
+- Uses Spleeter 2stems model (vocals/accompaniment)
+- CPU-only operation, optimized for speed
+- Only returns accompaniment track (no_vocals) as per requirements
+- Uses Spleeter CLI for simple, stable backend behavior
+- Preprocessing: mono 16kHz for speed
+- Expected: ~10 seconds for 1 minute audio on CPU
 """
 
 import shutil
 import subprocess
 import asyncio
 import logging
-import numpy as np
+import os
 from pathlib import Path
-from typing import Optional, Tuple
-
-import torch
+from typing import Optional
 
 from job_manager import Job, JobManager
 from downloader import download_file
@@ -28,184 +26,73 @@ from downloader import download_file
 # Set up logging
 logger = logging.getLogger(__name__)
 
-
-# Demucs configuration
-# Using "htdemucs" - the only valid/available pretrained model
-# Full 4-stem separation, then compute no_vocals = drums + bass + other
-# Optimized for CPU: mono input, 16kHz sample rate, no shifts, no overlap
-MODEL_NAME = "htdemucs"
-DEVICE = "cpu"
-# Target sample rate for CPU optimization (16kHz for speed)
+# Spleeter configuration
+MODEL_NAME = "spleeter:2stems"
+# Target sample rate for CPU optimization
 TARGET_SAMPLE_RATE = 16000
 
-# Global model instance and apply function
-_separator = None
-_apply_model = None
+# Global flag for model readiness
 _model_loaded = False
 _model_loading_error = None
 
 
 def load_model():
     """
-    Pre-load Demucs model into memory.
+    Pre-download Spleeter model.
     
-    Loads Demucs model as a library (not CLI) to avoid torchaudio.save() calls.
+    Spleeter downloads models on first use. We trigger this during startup
+    to avoid download delays during job processing.
     """
-    global _model_loaded, _separator, _apply_model, _model_loading_error
+    global _model_loaded, _model_loading_error
     
     if _model_loaded:
         return
     
-    print(f"Initializing Demucs ({MODEL_NAME}) as library for CPU...")
-    
-    # Set torch to use CPU
-    torch.set_num_threads(4)  # Reasonable thread count for VPS
+    print(f"Initializing Spleeter ({MODEL_NAME}) for CPU...")
     
     try:
-        from demucs.pretrained import get_model
-        from demucs.apply import apply_model
+        # Set TensorFlow to CPU-only mode
+        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
         
-        # Load model to trigger download
-        model = get_model(MODEL_NAME)
-        model.to(DEVICE)
-        model.eval()  # Set to evaluation mode
+        # Import spleeter to trigger model download
+        from spleeter.separator import Separator
         
-        # Store for reuse
-        _separator = model
-        _apply_model = apply_model
+        # Create separator to trigger model download
+        # This downloads the model if not already cached
+        separator = Separator(MODEL_NAME)
         
         _model_loaded = True
-        _model_loading_error = None  # Clear any previous error
-        print("Demucs model loaded successfully (library mode)")
+        _model_loading_error = None
+        print("Spleeter model loaded successfully")
         
     except Exception as e:
-        error_msg = f"Error loading Demucs model: {e}"
+        error_msg = f"Error loading Spleeter model: {e}"
         print(error_msg)
         _model_loading_error = str(e)
         raise
 
 
-def get_model():
-    """Get the loaded Demucs model"""
-    if not _model_loaded:
-        raise RuntimeError("Demucs model not loaded. Call load_model() first.")
-    return _separator
-
-
-def get_apply_model():
-    """Get the apply_model function"""
-    if not _model_loaded:
-        raise RuntimeError("Demucs model not loaded. Call load_model() first.")
-    return _apply_model
-
-
-def _load_audio_with_ffmpeg_sync(audio_path: Path) -> Tuple[torch.Tensor, int]:
+def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
     """
-    Load audio file using FFmpeg and convert to torch tensor (SYNCHRONOUS).
-    
-    OPTIMIZED for CPU speed:
-    - Stereo (2 channels) - required by htdemucs model
-    - Resamples to 16kHz for faster inference (~2.75x speedup vs 44.1kHz)
-    
-    This is a blocking operation that must run in an executor.
-    Uses subprocess.run (not asyncio) to avoid blocking the event loop.
+    Preprocess audio to mono 16kHz WAV using FFmpeg (SYNCHRONOUS).
     
     Args:
-        audio_path: Path to input audio file (any format)
-    
-    Returns:
-        Tuple of (audio_tensor, sample_rate)
-        audio_tensor: Shape (2, samples) as float32 tensor (stereo)
-        sample_rate: Sample rate in Hz (TARGET_SAMPLE_RATE)
+        input_path: Path to input audio file
+        output_path: Path to output preprocessed WAV
     """
-    logger.info(f"Loading audio with FFmpeg (sync, optimized for CPU): {audio_path}")
+    logger.info(f"Preprocessing audio: {input_path} -> {output_path}")
     
-    # Use FFmpeg to decode and preprocess audio:
-    # - Stereo (2 channels) - required by htdemucs
-    # - Resample to TARGET_SAMPLE_RATE (16kHz) for speed
-    # - Output as raw PCM (16-bit signed little-endian)
     cmd = [
-        "ffmpeg", "-i", str(audio_path),
-        "-f", "s16le",  # Raw PCM format
-        "-acodec", "pcm_s16le",
-        "-ar", str(TARGET_SAMPLE_RATE),  # Resample to target rate (16kHz)
-        "-ac", "2",  # Stereo (2 channels) - required by htdemucs
-        "-"  # Output to stdout
-    ]
-    
-    # Use subprocess.run (blocking, but runs in executor thread)
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False
-    )
-    
-    if result.returncode != 0:
-        error_msg = result.stderr.decode() if result.stderr else "Unknown error"
-        raise RuntimeError(f"FFmpeg audio loading failed: {error_msg}")
-    
-    # Convert raw PCM bytes to numpy array
-    # s16le = signed 16-bit little-endian, so we use int16
-    audio_data = np.frombuffer(result.stdout, dtype=np.int16)
-    
-    # Reshape to (2, samples) for stereo
-    num_channels = 2
-    num_samples = len(audio_data) // num_channels
-    audio_data = audio_data[:num_samples * num_channels].reshape(num_channels, num_samples)
-    
-    # Convert to float32 and normalize to [-1.0, 1.0]
-    audio_tensor = torch.from_numpy(audio_data.astype(np.float32) / 32768.0)
-    
-    logger.info(f"Loaded audio (stereo, {TARGET_SAMPLE_RATE}Hz): shape={audio_tensor.shape}, sample_rate={TARGET_SAMPLE_RATE}")
-    
-    return audio_tensor, TARGET_SAMPLE_RATE
-
-
-def _save_audio_with_ffmpeg_sync(audio_tensor: torch.Tensor, sample_rate: int, output_path: Path) -> None:
-    """
-    Save audio tensor to WAV file using FFmpeg (SYNCHRONOUS).
-    
-    This is a blocking operation that must run in an executor.
-    Uses subprocess.run (not asyncio) to avoid blocking the event loop.
-    
-    Args:
-        audio_tensor: Audio tensor with shape (channels, samples) as float32
-        sample_rate: Sample rate in Hz
-        output_path: Path to output WAV file
-    """
-    logger.info(f"Saving audio with FFmpeg (sync): {output_path}, shape={audio_tensor.shape}, sr={sample_rate}")
-    
-    # Ensure output directory exists
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Convert tensor to numpy and denormalize to int16
-    audio_np = audio_tensor.cpu().numpy()
-    # Clamp to [-1, 1] range
-    audio_np = np.clip(audio_np, -1.0, 1.0)
-    # Convert to int16
-    audio_int16 = (audio_np * 32767.0).astype(np.int16)
-    
-    # Convert to bytes (little-endian)
-    audio_bytes = audio_int16.tobytes()
-    
-    # Use FFmpeg to encode to WAV
-    # Input: raw PCM (s16le) from stdin
-    # Output: WAV file
-    cmd = [
-        "ffmpeg", "-y",  # Overwrite output
-        "-f", "s16le",  # Input format: signed 16-bit little-endian
-        "-ar", str(sample_rate),  # Sample rate
-        "-ac", str(audio_tensor.shape[0]),  # Number of channels
-        "-i", "-",  # Read from stdin
-        "-acodec", "pcm_s16le",  # Output codec
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-ac", "1",  # Mono
+        "-ar", str(TARGET_SAMPLE_RATE),  # 16kHz
+        "-acodec", "pcm_s16le",  # 16-bit PCM
         str(output_path)
     ]
     
-    # Use subprocess.run (blocking, but runs in executor thread)
     result = subprocess.run(
         cmd,
-        input=audio_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False
@@ -213,93 +100,78 @@ def _save_audio_with_ffmpeg_sync(audio_tensor: torch.Tensor, sample_rate: int, o
     
     if result.returncode != 0:
         error_msg = result.stderr.decode() if result.stderr else "Unknown error"
-        raise RuntimeError(f"FFmpeg audio saving failed: {error_msg}")
+        raise RuntimeError(f"FFmpeg preprocessing failed: {error_msg}")
     
-    if not output_path.exists():
-        raise RuntimeError(f"FFmpeg saving completed but output file not found: {output_path}")
-    
-    logger.info(f"Successfully saved audio: {output_path}")
+    logger.info(f"Preprocessed audio saved to: {output_path}")
 
 
-def _run_demucs_library_sync(audio_path: Path, output_dir: Path) -> Path:
+def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
     """
-    Run Demucs separation using the library API (SYNCHRONOUS).
+    Run Spleeter separation using CLI (SYNCHRONOUS).
     
     This is a blocking operation that must run in an executor.
-    Contains ALL CPU-bound work: FFmpeg, Demucs inference, torch operations.
-    
-    This avoids torchaudio.save() calls entirely by:
-    1. Loading audio with FFmpeg (sync)
-    2. Running Demucs inference in memory
-    3. Extracting no_vocals source
-    4. Saving with FFmpeg (sync)
     
     Args:
-        audio_path: Path to input audio file
+        audio_path: Path to input audio file (preprocessed)
         output_dir: Directory to write output
     
     Returns:
-        Path to the no_vocals.wav file
+        Path to the accompaniment.wav file (no_vocals)
     """
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    logger.info(f"Running Demucs separation (sync, library mode) on: {audio_path}")
+    logger.info(f"Running Spleeter separation on: {audio_path}")
     
-    # Step 1: Load audio using FFmpeg (synchronous, blocking)
-    audio_tensor, sample_rate = _load_audio_with_ffmpeg_sync(audio_path)
+    # Set TensorFlow to CPU-only mode
+    env = os.environ.copy()
+    env['CUDA_VISIBLE_DEVICES'] = '-1'
     
-    # Step 2: Get model and apply function
-    model = get_model()
-    apply_model = get_apply_model()
+    # Run Spleeter CLI
+    # spleeter separate -o output_dir -p spleeter:2stems input.wav
+    cmd = [
+        "spleeter", "separate",
+        "-o", str(output_dir),
+        "-p", MODEL_NAME,
+        str(audio_path)
+    ]
     
-    # Step 3: Prepare audio for Demucs
-    # Demucs expects shape (batch, channels, samples)
-    # Add batch dimension
-    audio_batch = audio_tensor.unsqueeze(0)  # Shape: (1, channels, samples)
+    logger.info(f"Spleeter command: {' '.join(cmd)}")
     
-    logger.info(f"Running Demucs inference on audio shape: {audio_batch.shape}")
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        check=False
+    )
     
-    # Step 4: Run Demucs inference (CPU-bound, blocking)
-    # OPTIMIZED for CPU speed:
-    # - shifts=0: No random shifts (faster, deterministic)
-    # - split=False: Process entire audio at once (faster for short audio)
-    # - overlap=0.0: No overlap (faster)
-    # - Full 4-stem separation, then compute no_vocals manually
-    with torch.no_grad():
-        sources = apply_model(
-            model,
-            audio_batch,
-            device=DEVICE,
-            shifts=0,  # No shifts for speed
-            split=False,  # No splitting for speed
-            overlap=0.0,  # No overlap for speed
-            progress=False
+    stdout_text = result.stdout.decode() if result.stdout else ""
+    stderr_text = result.stderr.decode() if result.stderr else ""
+    
+    if stdout_text:
+        logger.info(f"Spleeter stdout: {stdout_text[:500]}")
+    if stderr_text:
+        logger.info(f"Spleeter stderr: {stderr_text[:500]}")
+    
+    if result.returncode != 0:
+        raise RuntimeError(f"Spleeter failed (code {result.returncode}): {stderr_text}")
+    
+    # Spleeter outputs to: output_dir/audio_stem/accompaniment.wav
+    audio_stem = audio_path.stem
+    accompaniment_path = output_dir / audio_stem / "accompaniment.wav"
+    
+    if not accompaniment_path.exists():
+        # List files in output directory for debugging
+        output_files = list((output_dir / audio_stem).iterdir()) if (output_dir / audio_stem).exists() else []
+        raise RuntimeError(
+            f"Spleeter output not found: {accompaniment_path}. "
+            f"Available files: {[f.name for f in output_files]}"
         )
-        
-        # Sources shape: (batch, 4, channels, samples)
-        # Demucs sources order: [drums, bass, other, vocals]
-        # no_vocals = drums + bass + other (everything except vocals)
-        logger.info(f"Sources shape: {sources.shape}")
-        
-        if sources.shape[1] != 4:
-            raise RuntimeError(f"Expected 4 sources from demucs model, got {sources.shape[1]}")
-        
-        # Sum drums (0) + bass (1) + other (2) to get no_vocals
-        no_vocals = sources[0, 0:3].sum(dim=0)
     
-    logger.info(f"Demucs inference completed. no_vocals shape: {no_vocals.shape}")
+    logger.info(f"Spleeter separation completed: {accompaniment_path}")
     
-    # Step 5: Save no_vocals using FFmpeg (synchronous, blocking)
-    output_path = output_dir / "no_vocals.wav"
-    _save_audio_with_ffmpeg_sync(no_vocals, sample_rate, output_path)
-    
-    if not output_path.exists():
-        raise RuntimeError(f"Output file not found after saving: {output_path}")
-    
-    logger.info(f"Successfully created no_vocals.wav: {output_path}")
-    
-    return output_path
+    return accompaniment_path
 
 
 def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) -> dict:
@@ -307,16 +179,15 @@ def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) ->
     Process a vocal separation job (SYNCHRONOUS, blocking).
     
     This function contains ALL CPU-bound and blocking operations:
-    - Demucs inference (torch operations)
-    - FFmpeg audio loading/saving
+    - Audio preprocessing with FFmpeg
+    - Spleeter separation
     - File I/O operations
     
     This MUST run in an executor to avoid blocking the event loop.
-    Progress updates are handled by the async wrapper, not here.
     
     Args:
         job: Job instance with params
-        manager: JobManager instance (for cleanup, not progress updates)
+        manager: JobManager instance (for cleanup)
         audio_path: Path to downloaded audio file
     
     Returns:
@@ -324,31 +195,32 @@ def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) ->
     """
     logger.info(f"Processing separation job {job.job_id} (sync)")
     
-    # Model is guaranteed to be loaded during FastAPI startup (blocking)
-    # No waiting/polling needed here - if model isn't loaded, it's a fatal error
+    # Check model is ready
     if not _model_loaded:
         raise RuntimeError(
-            "Demucs model is not loaded. This should not happen - "
+            "Spleeter model is not loaded. This should not happen - "
             "models are loaded during startup before accepting requests."
         )
     
-    # Create a subdirectory for Demucs output
-    demucs_output_dir = job.work_dir / "demucs_output"
-    demucs_output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Demucs output directory: {demucs_output_dir}")
+    # Create working directories
+    work_dir = job.work_dir
+    preprocessed_path = work_dir / "preprocessed.wav"
+    spleeter_output_dir = work_dir / "spleeter_output"
     
-    # Run separation using library (synchronous, blocking)
-    # This contains ALL CPU-bound work: FFmpeg, Demucs inference, torch
-    logger.info("Starting Demucs separation process (sync, library mode)")
-    no_vocals_path = _run_demucs_library_sync(audio_path, demucs_output_dir)
-    logger.info(f"Demucs separation completed. Output: {no_vocals_path}")
+    # Step 1: Preprocess audio (mono 16kHz)
+    logger.info("Preprocessing audio to mono 16kHz")
+    _preprocess_audio_sync(audio_path, preprocessed_path)
     
-    # Copy to output directory (blocking file I/O)
+    # Step 2: Run Spleeter separation
+    logger.info("Running Spleeter separation")
+    accompaniment_path = _run_spleeter_sync(preprocessed_path, spleeter_output_dir)
+    
+    # Step 3: Copy output to static directory
     output_filename = f"{job.job_id}_no_vocals.wav"
     output_path = manager.output_dir / output_filename
     
     logger.info(f"Copying output to: {output_path}")
-    shutil.copy2(no_vocals_path, output_path)
+    shutil.copy2(accompaniment_path, output_path)
     
     if not output_path.exists():
         raise RuntimeError(f"Failed to copy output file to {output_path}")
@@ -372,7 +244,7 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     
     Steps:
     1. Download audio file (async I/O, 0-20% progress)
-    2. Schedule Demucs separation in executor (20-90% progress)
+    2. Schedule Spleeter separation in executor (20-90% progress)
     3. Copy output to static directory (in executor, 90-100% progress)
     
     Args:
@@ -388,7 +260,7 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     params = job.params
     media_url = params["media_url"]
     
-    # Step 1: Download audio file (async I/O - this is fine, doesn't block CPU)
+    # Step 1: Download audio file (async I/O)
     await manager.update_progress(job.job_id, 5)
     logger.info(f"Downloading audio from: {media_url}")
     
@@ -402,8 +274,6 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     await manager.update_progress(job.job_id, 20)
     
     # Step 2: Schedule ALL blocking work in executor
-    # This includes: Demucs inference, FFmpeg operations, file I/O
-    # The event loop remains responsive while this runs in a thread
     loop = asyncio.get_running_loop()
     
     await manager.update_progress(job.job_id, 30)
@@ -411,9 +281,8 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     logger.info("Scheduling blocking separation work in executor")
     
     # Run blocking work in executor (default ThreadPoolExecutor)
-    # This immediately yields control back to the event loop
     result = await loop.run_in_executor(
-        None,  # Use default ThreadPoolExecutor
+        None,
         _process_separation_sync,
         job,
         manager,

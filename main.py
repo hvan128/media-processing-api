@@ -5,7 +5,7 @@ Self-hosted backend for audio/video processing workflows.
 
 Provides:
 - Speech-to-Text (STT) transcription
-- Vocal separation (Demucs)
+- Vocal separation (Spleeter)
 - Audio-video merging (FFmpeg)
 
 All operations are asynchronous with job polling.
@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, HttpUrl
 
 from job_manager import job_manager, JobType, JobStatus
 from stt_service import load_model as load_whisper_model, process_stt
-from separation_service import load_model as load_demucs_model, process_separation
+from separation_service import load_model as load_spleeter_model, process_separation
 from merge_service import process_merge
 
 
@@ -91,8 +91,8 @@ def _load_all_models_sync():
     print("Loading Whisper model...")
     load_whisper_model()
     
-    print("Loading Demucs model...")
-    load_demucs_model()
+    print("Loading Spleeter model...")
+    load_spleeter_model()
     
     print("All models loaded successfully!")
 

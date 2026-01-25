@@ -10,10 +10,9 @@ aiofiles==23.2.1
 # Speech-to-text
 faster-whisper==1.0.0
 
-# Vocal separation (Demucs)
-demucs==4.0.1
-torch==2.1.2
-torchaudio==2.1.2
+# Vocal separation (Spleeter)
+# Spleeter is faster on CPU than Demucs (~10s for 1min audio)
+spleeter==2.4.0
 
 # Utilities
 pydantic==2.5.3
