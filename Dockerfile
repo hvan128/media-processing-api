@@ -19,7 +19,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # - libavformat-dev, etc.: FFmpeg dev libraries for building PyAV
 # - libsndfile1: Audio file reading (for Spleeter)
 # - libgomp: OpenMP library required by CTranslate2 (faster-whisper)
-# - pkg-config: Required for building PyAV
+# - pkg-config, gcc, python3-dev: Required for building PyAV
 # - curl: Health checks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -33,6 +33,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     libgomp1 \
     pkg-config \
+    gcc \
+    python3-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
