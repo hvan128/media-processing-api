@@ -40,7 +40,9 @@ RUN mkdir -p /data/output /data/jobs
 RUN pip install "numpy<2.0.0"
 
 # Install Spleeter (uses TensorFlow, CPU-only by default)
-RUN pip install spleeter==2.4.0
+# Pin typer<0.10.0 for compatibility with spleeter 2.4.0
+RUN pip install "typer<0.10.0" && \
+    pip install spleeter==2.4.0
 
 # Install PyAV from pre-built wheel (avoid building from source)
 # av>=12 has wheels compatible with manylinux
