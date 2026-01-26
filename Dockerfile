@@ -56,9 +56,16 @@ RUN pip install fastapi==0.109.0 uvicorn[standard]==0.27.0 \
     python-multipart==0.0.6 httpx==0.26.0 aiofiles==23.2.1 \
     pydantic==2.5.3 python-dotenv==1.0.0
 
-# Pre-download ML models during build (reduces first-run latency)
-# Spleeter models are downloaded on first use, we trigger it here
-RUN python -c "from spleeter.separator import Separator; s = Separator('spleeter:2stems'); print('Spleeter model ready')"
+# Pre-download Spleeter model during build (reduces first-run latency)
+# Note: GitHub releases return 302 redirects that keras downloader doesn't handle
+# We download manually with curl which follows redirects properly
+ENV MODEL_PATH=/root/pretrained_models
+RUN mkdir -p /root/pretrained_models/2stems && \
+    curl -L -o /tmp/2stems.tar.gz \
+      "https://github.com/deezer/spleeter/releases/download/v1.4.0/2stems.tar.gz" && \
+    tar -xzf /tmp/2stems.tar.gz -C /root/pretrained_models/2stems && \
+    rm /tmp/2stems.tar.gz && \
+    echo "Spleeter model downloaded"
 
 # Copy application code
 COPY *.py .

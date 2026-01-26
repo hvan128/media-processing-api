@@ -10,6 +10,7 @@ Design Decisions:
 - Uses Spleeter as PYTHON LIBRARY (not CLI) to avoid typer import issues
 - Preprocessing: mono 16kHz for speed
 - Expected: ~10 seconds for 1 minute audio on CPU
+- Pre-downloads model with redirect handling to fix GitHub 302 issue
 """
 
 import shutil
@@ -17,8 +18,12 @@ import subprocess
 import asyncio
 import logging
 import os
+import tarfile
+import tempfile
 from pathlib import Path
 from typing import Optional
+
+import httpx
 
 from job_manager import Job, JobManager
 from downloader import download_file
@@ -31,10 +36,69 @@ MODEL_NAME = "spleeter:2stems"
 # Target sample rate for CPU optimization
 TARGET_SAMPLE_RATE = 16000
 
+# Model download configuration
+SPLEETER_MODEL_URL = "https://github.com/deezer/spleeter/releases/download/v1.4.0/2stems.tar.gz"
+# Use MODEL_PATH env var if set (Docker), otherwise use home directory
+_model_base = Path(os.environ.get("MODEL_PATH", str(Path.home() / "pretrained_models")))
+SPLEETER_MODEL_DIR = _model_base / "2stems"
+
 # Global separator instance
 _separator = None
 _model_loaded = False
 _model_loading_error = None
+
+
+def _download_spleeter_model():
+    """
+    Download Spleeter 2stems model manually with redirect support.
+    
+    GitHub releases return 302 redirects that Spleeter's internal downloader
+    doesn't handle properly. This function downloads the model using httpx
+    which correctly follows redirects.
+    """
+    # Check if model already exists
+    model_json = SPLEETER_MODEL_DIR / "checkpoint"
+    if model_json.exists():
+        print(f"Spleeter model already exists at {SPLEETER_MODEL_DIR}")
+        return
+    
+    print(f"Downloading Spleeter 2stems model from GitHub...")
+    print(f"URL: {SPLEETER_MODEL_URL}")
+    
+    # Create model directory
+    SPLEETER_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Download with redirect support
+    with httpx.Client(follow_redirects=True, timeout=300.0) as client:
+        response = client.get(SPLEETER_MODEL_URL)
+        response.raise_for_status()
+        
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp.write(response.content)
+            tmp_path = tmp.name
+    
+    print(f"Downloaded model archive, extracting...")
+    
+    # Extract tar.gz
+    try:
+        with tarfile.open(tmp_path, "r:gz") as tar:
+            tar.extractall(path=SPLEETER_MODEL_DIR)
+        print(f"Model extracted to {SPLEETER_MODEL_DIR}")
+    finally:
+        # Clean up temp file
+        os.unlink(tmp_path)
+    
+    # Verify extraction
+    if not model_json.exists():
+        # List extracted files for debugging
+        extracted = list(SPLEETER_MODEL_DIR.iterdir())
+        raise RuntimeError(
+            f"Model extraction failed. Expected {model_json}. "
+            f"Found: {[f.name for f in extracted]}"
+        )
+    
+    print("Spleeter model downloaded and extracted successfully")
 
 
 def load_model():
@@ -43,6 +107,7 @@ def load_model():
     
     Loads Spleeter separator at startup to avoid delays during job processing.
     Uses Python library directly (not CLI) to avoid typer import issues.
+    Pre-downloads model with proper redirect handling.
     """
     global _separator, _model_loaded, _model_loading_error
     
@@ -56,10 +121,16 @@ def load_model():
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF warnings
         
+        # Set model directory for Spleeter (parent of 2stems folder)
+        os.environ['MODEL_PATH'] = str(SPLEETER_MODEL_DIR.parent)
+        
+        # Pre-download model with redirect support (fixes GitHub 302 issue)
+        _download_spleeter_model()
+        
         # Import spleeter library directly (bypasses CLI and typer)
         from spleeter.separator import Separator
         
-        # Create separator instance - this downloads the model
+        # Create separator instance - model is already downloaded
         _separator = Separator(MODEL_NAME)
         
         _model_loaded = True
