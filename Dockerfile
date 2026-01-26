@@ -40,11 +40,8 @@ RUN mkdir -p /data/output /data/jobs
 RUN pip install "numpy<2.0.0"
 
 # Install Spleeter (uses TensorFlow, CPU-only by default)
-# Pin typer<0.10.0 for compatibility with spleeter 2.4.0
-# Force typer version before and after spleeter to prevent upgrade
-RUN pip install "typer<0.10.0" && \
-    pip install spleeter==2.4.0 && \
-    pip install --force-reinstall --no-deps "typer<0.10.0"
+# Note: We use Spleeter as a library, not CLI, to avoid typer compatibility issues
+RUN pip install spleeter==2.4.0
 
 # Install PyAV from pre-built wheel (avoid building from source)
 # av>=12 has wheels compatible with manylinux

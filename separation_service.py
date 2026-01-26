@@ -7,7 +7,7 @@ Design Decisions:
 - Uses Spleeter 2stems model (vocals/accompaniment)
 - CPU-only operation, optimized for speed
 - Only returns accompaniment track (no_vocals) as per requirements
-- Uses Spleeter CLI for simple, stable backend behavior
+- Uses Spleeter as PYTHON LIBRARY (not CLI) to avoid typer import issues
 - Preprocessing: mono 16kHz for speed
 - Expected: ~10 seconds for 1 minute audio on CPU
 """
@@ -31,19 +31,20 @@ MODEL_NAME = "spleeter:2stems"
 # Target sample rate for CPU optimization
 TARGET_SAMPLE_RATE = 16000
 
-# Global flag for model readiness
+# Global separator instance
+_separator = None
 _model_loaded = False
 _model_loading_error = None
 
 
 def load_model():
     """
-    Pre-download Spleeter model.
+    Pre-load Spleeter model.
     
-    Spleeter downloads models on first use. We trigger this during startup
-    to avoid download delays during job processing.
+    Loads Spleeter separator at startup to avoid delays during job processing.
+    Uses Python library directly (not CLI) to avoid typer import issues.
     """
-    global _model_loaded, _model_loading_error
+    global _separator, _model_loaded, _model_loading_error
     
     if _model_loaded:
         return
@@ -51,15 +52,15 @@ def load_model():
     print(f"Initializing Spleeter ({MODEL_NAME}) for CPU...")
     
     try:
-        # Set TensorFlow to CPU-only mode
+        # Set TensorFlow to CPU-only mode before importing
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TF warnings
         
-        # Import spleeter to trigger model download
+        # Import spleeter library directly (bypasses CLI and typer)
         from spleeter.separator import Separator
         
-        # Create separator to trigger model download
-        # This downloads the model if not already cached
-        separator = Separator(MODEL_NAME)
+        # Create separator instance - this downloads the model
+        _separator = Separator(MODEL_NAME)
         
         _model_loaded = True
         _model_loading_error = None
@@ -107,9 +108,9 @@ def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
 
 def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
     """
-    Run Spleeter separation using CLI (SYNCHRONOUS).
+    Run Spleeter separation using Python library (SYNCHRONOUS).
     
-    This is a blocking operation that must run in an executor.
+    Uses Spleeter as a library directly, bypassing CLI to avoid typer issues.
     
     Args:
         audio_path: Path to input audio file (preprocessed)
@@ -118,44 +119,22 @@ def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
     Returns:
         Path to the accompaniment.wav file (no_vocals)
     """
+    global _separator
+    
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
     
     logger.info(f"Running Spleeter separation on: {audio_path}")
     
-    # Set TensorFlow to CPU-only mode
-    env = os.environ.copy()
-    env['CUDA_VISIBLE_DEVICES'] = '-1'
+    if _separator is None:
+        raise RuntimeError("Spleeter separator not initialized")
     
-    # Run Spleeter CLI
-    # spleeter separate -o output_dir -p spleeter:2stems input.wav
-    cmd = [
-        "spleeter", "separate",
-        "-o", str(output_dir),
-        "-p", MODEL_NAME,
-        str(audio_path)
-    ]
-    
-    logger.info(f"Spleeter command: {' '.join(cmd)}")
-    
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        check=False
+    # Run separation using library API
+    # separate_to_file writes output to output_dir/audio_stem/
+    _separator.separate_to_file(
+        str(audio_path),
+        str(output_dir)
     )
-    
-    stdout_text = result.stdout.decode() if result.stdout else ""
-    stderr_text = result.stderr.decode() if result.stderr else ""
-    
-    if stdout_text:
-        logger.info(f"Spleeter stdout: {stdout_text[:500]}")
-    if stderr_text:
-        logger.info(f"Spleeter stderr: {stderr_text[:500]}")
-    
-    if result.returncode != 0:
-        raise RuntimeError(f"Spleeter failed (code {result.returncode}): {stderr_text}")
     
     # Spleeter outputs to: output_dir/audio_stem/accompaniment.wav
     audio_stem = audio_path.stem
@@ -163,7 +142,8 @@ def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
     
     if not accompaniment_path.exists():
         # List files in output directory for debugging
-        output_files = list((output_dir / audio_stem).iterdir()) if (output_dir / audio_stem).exists() else []
+        stem_dir = output_dir / audio_stem
+        output_files = list(stem_dir.iterdir()) if stem_dir.exists() else []
         raise RuntimeError(
             f"Spleeter output not found: {accompaniment_path}. "
             f"Available files: {[f.name for f in output_files]}"
