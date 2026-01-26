@@ -1,16 +1,31 @@
 """
 Vocal Separation Service Module
 ===============================
-Handles vocal separation using Spleeter.
+Handles vocal separation using Spleeter, optimized for speech + industrial sounds.
 
 Design Decisions:
 - Uses Spleeter 2stems model (vocals/accompaniment)
-- CPU-only operation, optimized for speed
+- CPU-only operation, optimized for quality over speed
 - Only returns accompaniment track (no_vocals) as per requirements
 - Uses Spleeter as PYTHON LIBRARY (not CLI) to avoid typer import issues
-- Preprocessing: mono 16kHz for speed
-- Expected: ~10 seconds for 1 minute audio on CPU
+
+Audio Quality Optimizations for Industrial Sounds:
+- 44.1kHz sample rate (CD quality) preserves high frequencies
+  * Important for metal drilling, impacts, tool sounds which have high-frequency content
+  * Trade-off: ~2.75x slower than 16kHz, but much better quality
+- Keeps stereo if input is stereo (better spatial information)
+- Blends 15% vocals back into accompaniment to recover misclassified tool sounds
+  * Spleeter was trained on music, not industrial sounds
+  * Some high-frequency tool sounds may be incorrectly classified as vocals
+  * Blending helps preserve these sounds in the final output
+
+Expected Performance:
+- ~25-30 seconds for 1 minute audio on CPU (with 44.1kHz)
 - Pre-downloads model with redirect handling to fix GitHub 302 issue
+
+Limitations:
+- Spleeter was trained on music datasets, not speech + industrial sounds
+- Perfect separation is not possible, but quality is improved with above optimizations
 """
 
 import shutil
@@ -33,8 +48,20 @@ logger = logging.getLogger(__name__)
 
 # Spleeter configuration
 MODEL_NAME = "spleeter:2stems"
-# Target sample rate for CPU optimization
-TARGET_SAMPLE_RATE = 16000
+# Target sample rate: 44100Hz (CD quality) to preserve high frequencies
+# Important for industrial sounds (drilling, metal impacts) which have high-frequency content
+# Trade-off: ~2.75x slower than 16kHz, but much better quality for non-music audio
+TARGET_SAMPLE_RATE = 44100
+# Keep stereo if input is stereo (better spatial information for tools)
+# Mono is forced only if input is mono
+KEEP_STEREO = True
+
+# Vocals blend ratio: blend a small portion of vocals back into accompaniment
+# This helps preserve tool sounds that Spleeter may have incorrectly classified as vocals
+# Range: 0.0 (no blend) to 1.0 (full blend). 0.15 = 15% vocals blended back
+# For industrial sounds (drilling, metal), some high-frequency tool sounds may be
+# misclassified as vocals, so blending helps recover them
+VOCALS_BLEND_RATIO = 0.15  # 15% vocals blended back
 
 # Model download configuration
 SPLEETER_MODEL_URL = "https://github.com/deezer/spleeter/releases/download/v1.4.0/2stems.tar.gz"
@@ -146,7 +173,12 @@ def load_model():
 
 def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
     """
-    Preprocess audio to mono 16kHz WAV using FFmpeg (SYNCHRONOUS).
+    Preprocess audio to 44.1kHz WAV using FFmpeg (SYNCHRONOUS).
+    
+    Optimized for speech + industrial sounds (drilling, metal impacts):
+    - 44.1kHz sample rate preserves high frequencies (important for metal sounds)
+    - Keeps stereo if input is stereo (better spatial information)
+    - Only converts to mono if input is mono
     
     Args:
         input_path: Path to input audio file
@@ -154,14 +186,40 @@ def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
     """
     logger.info(f"Preprocessing audio: {input_path} -> {output_path}")
     
+    # Check if input is stereo by probing with ffprobe
+    probe_cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=channels",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(input_path)
+    ]
+    probe_result = subprocess.run(
+        probe_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False
+    )
+    
+    # Determine channel configuration
+    if probe_result.returncode == 0:
+        channels = probe_result.stdout.decode().strip()
+        is_stereo = channels == "2" and KEEP_STEREO
+    else:
+        # Fallback: assume mono if probe fails
+        is_stereo = False
+    
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
-        "-ac", "1",  # Mono
-        "-ar", str(TARGET_SAMPLE_RATE),  # 16kHz
+        "-ar", str(TARGET_SAMPLE_RATE),  # 44.1kHz for high-frequency preservation
         "-acodec", "pcm_s16le",  # 16-bit PCM
-        str(output_path)
     ]
+    
+    # Only force mono if input is mono or KEEP_STEREO is False
+    if not is_stereo:
+        cmd.extend(["-ac", "1"])  # Mono
+    
+    cmd.append(str(output_path))
     
     result = subprocess.run(
         cmd,
@@ -174,7 +232,57 @@ def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
         error_msg = result.stderr.decode() if result.stderr else "Unknown error"
         raise RuntimeError(f"FFmpeg preprocessing failed: {error_msg}")
     
-    logger.info(f"Preprocessed audio saved to: {output_path}")
+    channel_info = "stereo" if is_stereo else "mono"
+    logger.info(f"Preprocessed audio saved to: {output_path} ({channel_info}, {TARGET_SAMPLE_RATE}Hz)")
+
+
+def _blend_audio_sync(accompaniment_path: Path, vocals_path: Path, output_path: Path, blend_ratio: float) -> None:
+    """
+    Blend a portion of vocals back into accompaniment using FFmpeg.
+    
+    This helps recover tool sounds that Spleeter may have incorrectly classified as vocals.
+    For industrial sounds (drilling, metal impacts), some high-frequency content may be
+    misclassified, so blending helps preserve them in the final output.
+    
+    Args:
+        accompaniment_path: Path to accompaniment.wav (no vocals)
+        vocals_path: Path to vocals.wav
+        output_path: Path to output blended file
+        blend_ratio: Ratio of vocals to blend (0.0-1.0), e.g., 0.15 = 15%
+    """
+    logger.info(f"Blending {blend_ratio*100:.1f}% vocals back into accompaniment")
+    
+    # FFmpeg complex filter: mix accompaniment with scaled vocals
+    # Formula: output = accompaniment + (vocals * blend_ratio)
+    filter_complex = (
+        f"[0:a]volume=1.0[acc];"
+        f"[1:a]volume={blend_ratio}[voc];"
+        f"[acc][voc]amix=inputs=2:duration=first:dropout_transition=0"
+    )
+    
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(accompaniment_path),
+        "-i", str(vocals_path),
+        "-filter_complex", filter_complex,
+        "-acodec", "pcm_s16le",
+        str(output_path)
+    ]
+    
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False
+    )
+    
+    if result.returncode != 0:
+        error_msg = result.stderr.decode() if result.stderr else "Unknown error"
+        logger.warning(f"Audio blending failed: {error_msg}, using original accompaniment")
+        # Fallback: copy original accompaniment
+        shutil.copy2(accompaniment_path, output_path)
+    else:
+        logger.info(f"Blended audio saved to: {output_path}")
 
 
 def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
@@ -207,13 +315,14 @@ def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
         str(output_dir)
     )
     
-    # Spleeter outputs to: output_dir/audio_stem/accompaniment.wav
+    # Spleeter outputs to: output_dir/audio_stem/accompaniment.wav and vocals.wav
     audio_stem = audio_path.stem
-    accompaniment_path = output_dir / audio_stem / "accompaniment.wav"
+    stem_dir = output_dir / audio_stem
+    accompaniment_path = stem_dir / "accompaniment.wav"
+    vocals_path = stem_dir / "vocals.wav"
     
     if not accompaniment_path.exists():
         # List files in output directory for debugging
-        stem_dir = output_dir / audio_stem
         output_files = list(stem_dir.iterdir()) if stem_dir.exists() else []
         raise RuntimeError(
             f"Spleeter output not found: {accompaniment_path}. "
@@ -221,6 +330,14 @@ def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
         )
     
     logger.info(f"Spleeter separation completed: {accompaniment_path}")
+    
+    # Blend vocals back into accompaniment to recover misclassified tool sounds
+    # This is especially important for industrial sounds (drilling, metal impacts)
+    # where high-frequency content may be incorrectly classified as vocals
+    if VOCALS_BLEND_RATIO > 0.0 and vocals_path.exists():
+        blended_path = stem_dir / "accompaniment_blended.wav"
+        _blend_audio_sync(accompaniment_path, vocals_path, blended_path, VOCALS_BLEND_RATIO)
+        return blended_path
     
     return accompaniment_path
 
