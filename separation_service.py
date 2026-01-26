@@ -14,10 +14,12 @@ Audio Quality Optimizations for Industrial Sounds:
   * Important for metal drilling, impacts, tool sounds which have high-frequency content
   * Trade-off: ~2.75x slower than 16kHz, but much better quality
 - Keeps stereo if input is stereo (better spatial information)
-- Blends 15% vocals back into accompaniment to recover misclassified tool sounds
-  * Spleeter was trained on music, not industrial sounds
-  * Some high-frequency tool sounds may be incorrectly classified as vocals
-  * Blending helps preserve these sounds in the final output
+- Blends 10% of HIGH-FREQUENCY vocals (>5kHz) back into accompaniment
+  * Strategy: Human speech is 300-3000Hz, tool sounds are 5-20kHz
+  * High-pass filter (>5kHz) on vocals before blending:
+    - Recovers high-frequency tool sounds misclassified as vocals
+    - Avoids bringing back human speech (which is in lower frequencies)
+  * Spleeter was trained on music, not industrial sounds, so misclassification happens
 
 Expected Performance:
 - ~25-30 seconds for 1 minute audio on CPU (with 44.1kHz)
@@ -56,12 +58,11 @@ TARGET_SAMPLE_RATE = 44100
 # Mono is forced only if input is mono
 KEEP_STEREO = True
 
-# Vocals blend ratio: blend a small portion of vocals back into accompaniment
-# This helps preserve tool sounds that Spleeter may have incorrectly classified as vocals
-# Range: 0.0 (no blend) to 1.0 (full blend). 0.15 = 15% vocals blended back
-# For industrial sounds (drilling, metal), some high-frequency tool sounds may be
-# misclassified as vocals, so blending helps recover them
-VOCALS_BLEND_RATIO = 0.15  # 15% vocals blended back
+# Vocals blend configuration: blend only HIGH-FREQUENCY portion of vocals
+# Strategy: Human speech is mainly 300-3000Hz, tool sounds are 5-20kHz
+# By blending only high frequencies (>5kHz), we recover tool sounds without bringing back speech
+VOCALS_BLEND_RATIO = 0.10  # 10% of high-frequency vocals blended back
+VOCALS_HIGHPASS_FREQ = 5000  # Only blend frequencies above 5kHz (removes speech, keeps tool sounds)
 
 # Model download configuration
 SPLEETER_MODEL_URL = "https://github.com/deezer/spleeter/releases/download/v1.4.0/2stems.tar.gz"
@@ -236,28 +237,41 @@ def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
     logger.info(f"Preprocessed audio saved to: {output_path} ({channel_info}, {TARGET_SAMPLE_RATE}Hz)")
 
 
-def _blend_audio_sync(accompaniment_path: Path, vocals_path: Path, output_path: Path, blend_ratio: float) -> None:
+def _blend_audio_sync(
+    accompaniment_path: Path, 
+    vocals_path: Path, 
+    output_path: Path, 
+    blend_ratio: float,
+    highpass_freq: int = 5000
+) -> None:
     """
-    Blend a portion of vocals back into accompaniment using FFmpeg.
+    Blend HIGH-FREQUENCY portion of vocals back into accompaniment using FFmpeg.
     
-    This helps recover tool sounds that Spleeter may have incorrectly classified as vocals.
-    For industrial sounds (drilling, metal impacts), some high-frequency content may be
-    misclassified, so blending helps preserve them in the final output.
+    Strategy: Human speech is mainly 300-3000Hz, while tool sounds (drilling, metal) are 5-20kHz.
+    By applying high-pass filter (>5kHz) to vocals before blending, we:
+    - Recover high-frequency tool sounds that were misclassified as vocals
+    - Avoid bringing back human speech (which is in lower frequencies)
     
     Args:
         accompaniment_path: Path to accompaniment.wav (no vocals)
         vocals_path: Path to vocals.wav
         output_path: Path to output blended file
-        blend_ratio: Ratio of vocals to blend (0.0-1.0), e.g., 0.15 = 15%
+        blend_ratio: Ratio of filtered vocals to blend (0.0-1.0), e.g., 0.10 = 10%
+        highpass_freq: High-pass filter frequency in Hz (default 5000 = 5kHz)
     """
-    logger.info(f"Blending {blend_ratio*100:.1f}% vocals back into accompaniment")
+    logger.info(
+        f"Blending {blend_ratio*100:.1f}% of vocals (high-pass >{highpass_freq}Hz) "
+        f"back into accompaniment to recover tool sounds"
+    )
     
-    # FFmpeg complex filter: mix accompaniment with scaled vocals
-    # Formula: output = accompaniment + (vocals * blend_ratio)
+    # FFmpeg complex filter:
+    # 1. Apply high-pass filter to vocals (removes speech, keeps high-frequency tool sounds)
+    # 2. Scale filtered vocals by blend_ratio
+    # 3. Mix with accompaniment
+    # Formula: output = accompaniment + (highpass(vocals, >5kHz) * blend_ratio)
     filter_complex = (
-        f"[0:a]volume=1.0[acc];"
-        f"[1:a]volume={blend_ratio}[voc];"
-        f"[acc][voc]amix=inputs=2:duration=first:dropout_transition=0"
+        f"[1:a]highpass=f={highpass_freq},volume={blend_ratio}[voc_filtered];"
+        f"[0:a][voc_filtered]amix=inputs=2:duration=first:dropout_transition=0"
     )
     
     cmd = [
@@ -331,12 +345,18 @@ def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
     
     logger.info(f"Spleeter separation completed: {accompaniment_path}")
     
-    # Blend vocals back into accompaniment to recover misclassified tool sounds
-    # This is especially important for industrial sounds (drilling, metal impacts)
-    # where high-frequency content may be incorrectly classified as vocals
+    # Blend HIGH-FREQUENCY vocals back into accompaniment to recover misclassified tool sounds
+    # Strategy: Apply high-pass filter (>5kHz) to vocals before blending
+    # This recovers high-frequency tool sounds while avoiding human speech (300-3000Hz)
     if VOCALS_BLEND_RATIO > 0.0 and vocals_path.exists():
         blended_path = stem_dir / "accompaniment_blended.wav"
-        _blend_audio_sync(accompaniment_path, vocals_path, blended_path, VOCALS_BLEND_RATIO)
+        _blend_audio_sync(
+            accompaniment_path, 
+            vocals_path, 
+            blended_path, 
+            VOCALS_BLEND_RATIO,
+            VOCALS_HIGHPASS_FREQ
+        )
         return blended_path
     
     return accompaniment_path
