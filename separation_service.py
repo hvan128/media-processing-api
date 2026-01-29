@@ -58,11 +58,19 @@ TARGET_SAMPLE_RATE = 44100
 # Mono is forced only if input is mono
 KEEP_STEREO = True
 
-# Vocals blend configuration: blend only HIGH-FREQUENCY portion of vocals
-# Strategy: Human speech is mainly 300-3000Hz, tool sounds are 5-20kHz
-# By blending only high frequencies (>5kHz), we recover tool sounds without bringing back speech
-VOCALS_BLEND_RATIO = 0.10  # 10% of high-frequency vocals blended back
-VOCALS_HIGHPASS_FREQ = 5000  # Only blend frequencies above 5kHz (removes speech, keeps tool sounds)
+# Vocals blend configuration.
+# NOTE: For maximum speech removal we disable blending entirely (ratio = 0.0).
+# The blending pipeline is kept for potential future profiles but currently OFF.
+VOCALS_BLEND_RATIO = 0.0
+VOCALS_HIGHPASS_FREQ = 5000  # Only used if VOCALS_BLEND_RATIO > 0.0
+
+# Aggressive speech suppression on final accompaniment:
+# - Apply a strong high-pass filter to the accompaniment output.
+# - This heavily attenuates human speech (mostly < 3-4kHz).
+# - Tool sounds (drilling, metal impacts) often have significant energy > 4-5kHz,
+#   so some characteristics are preserved, but low/mid-frequency content will be lost.
+ENABLE_SPEECH_SUPPRESSION = True
+SPEECH_SUPPRESSION_HIGHPASS_FREQ = 4000  # Hz; increase for stronger speech removal
 
 # Model download configuration
 SPLEETER_MODEL_URL = "https://github.com/deezer/spleeter/releases/download/v1.4.0/2stems.tar.gz"
@@ -238,65 +246,108 @@ def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
 
 
 def _blend_audio_sync(
-    accompaniment_path: Path, 
-    vocals_path: Path, 
-    output_path: Path, 
+    accompaniment_path: Path,
+    vocals_path: Path,
+    output_path: Path,
     blend_ratio: float,
-    highpass_freq: int = 5000
+    highpass_freq: int = 5000,
 ) -> None:
     """
     Blend HIGH-FREQUENCY portion of vocals back into accompaniment using FFmpeg.
-    
-    Strategy: Human speech is mainly 300-3000Hz, while tool sounds (drilling, metal) are 5-20kHz.
-    By applying high-pass filter (>5kHz) to vocals before blending, we:
-    - Recover high-frequency tool sounds that were misclassified as vocals
-    - Avoid bringing back human speech (which is in lower frequencies)
-    
-    Args:
-        accompaniment_path: Path to accompaniment.wav (no vocals)
-        vocals_path: Path to vocals.wav
-        output_path: Path to output blended file
-        blend_ratio: Ratio of filtered vocals to blend (0.0-1.0), e.g., 0.10 = 10%
-        highpass_freq: High-pass filter frequency in Hz (default 5000 = 5kHz)
+
+    NOTE: Currently disabled by setting VOCALS_BLEND_RATIO = 0.0 for maximum
+    speech removal. The implementation is kept for future tuning profiles.
     """
+    if blend_ratio <= 0.0:
+        # No blending requested, just copy accompaniment.
+        shutil.copy2(accompaniment_path, output_path)
+        return
+
     logger.info(
         f"Blending {blend_ratio*100:.1f}% of vocals (high-pass >{highpass_freq}Hz) "
         f"back into accompaniment to recover tool sounds"
     )
-    
-    # FFmpeg complex filter:
-    # 1. Apply high-pass filter to vocals (removes speech, keeps high-frequency tool sounds)
-    # 2. Scale filtered vocals by blend_ratio
-    # 3. Mix with accompaniment
-    # Formula: output = accompaniment + (highpass(vocals, >5kHz) * blend_ratio)
+
     filter_complex = (
         f"[1:a]highpass=f={highpass_freq},volume={blend_ratio}[voc_filtered];"
         f"[0:a][voc_filtered]amix=inputs=2:duration=first:dropout_transition=0"
     )
-    
+
     cmd = [
-        "ffmpeg", "-y",
-        "-i", str(accompaniment_path),
-        "-i", str(vocals_path),
-        "-filter_complex", filter_complex,
-        "-acodec", "pcm_s16le",
-        str(output_path)
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(accompaniment_path),
+        "-i",
+        str(vocals_path),
+        "-filter_complex",
+        filter_complex,
+        "-acodec",
+        "pcm_s16le",
+        str(output_path),
     ]
-    
+
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=False
+        check=False,
     )
-    
+
     if result.returncode != 0:
         error_msg = result.stderr.decode() if result.stderr else "Unknown error"
-        logger.warning(f"Audio blending failed: {error_msg}, using original accompaniment")
-        # Fallback: copy original accompaniment
+        logger.warning(
+            f"Audio blending failed: {error_msg}, using original accompaniment"
+        )
         shutil.copy2(accompaniment_path, output_path)
     else:
         logger.info(f"Blended audio saved to: {output_path}")
+
+
+def _suppress_speech_sync(input_path: Path, output_path: Path) -> None:
+    """
+    Apply aggressive speech suppression using a high-pass filter.
+
+    This is a lossy operation aimed at *removing human speech as much as possible*,
+    even if some tool sound quality is sacrificed.
+
+    - Human speech energy is mostly < 3-4kHz.
+    - We apply a strong high-pass filter at SPEECH_SUPPRESSION_HIGHPASS_FREQ.
+    - Tool sounds (drilling/metal) often have significant high-frequency content
+      that survives this filter.
+    """
+    logger.info(
+        f"Applying aggressive speech suppression high-pass filter at "
+        f"{SPEECH_SUPPRESSION_HIGHPASS_FREQ}Hz"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-af",
+        f"highpass=f={SPEECH_SUPPRESSION_HIGHPASS_FREQ}",
+        "-acodec",
+        "pcm_s16le",
+        str(output_path),
+    ]
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        error_msg = result.stderr.decode() if result.stderr else "Unknown error"
+        logger.warning(
+            f"Speech suppression filter failed: {error_msg}, using original accompaniment"
+        )
+        shutil.copy2(input_path, output_path)
+    else:
+        logger.info(f"Speech-suppressed accompaniment saved to: {output_path}")
 
 
 def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
@@ -346,8 +397,7 @@ def _run_spleeter_sync(audio_path: Path, output_dir: Path) -> Path:
     logger.info(f"Spleeter separation completed: {accompaniment_path}")
     
     # Blend HIGH-FREQUENCY vocals back into accompaniment to recover misclassified tool sounds
-    # Strategy: Apply high-pass filter (>5kHz) to vocals before blending
-    # This recovers high-frequency tool sounds while avoiding human speech (300-3000Hz)
+    # NOTE: Currently disabled via VOCALS_BLEND_RATIO = 0.0 for maximum speech removal.
     if VOCALS_BLEND_RATIO > 0.0 and vocals_path.exists():
         blended_path = stem_dir / "accompaniment_blended.wav"
         _blend_audio_sync(
@@ -402,13 +452,21 @@ def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) ->
     # Step 2: Run Spleeter separation
     logger.info("Running Spleeter separation")
     accompaniment_path = _run_spleeter_sync(preprocessed_path, spleeter_output_dir)
-    
-    # Step 3: Copy output to static directory
+
+    # Step 3: Aggressive speech suppression (optional)
+    if ENABLE_SPEECH_SUPPRESSION:
+        suppressed_path = work_dir / "accompaniment_suppressed.wav"
+        _suppress_speech_sync(accompaniment_path, suppressed_path)
+        final_path = suppressed_path
+    else:
+        final_path = accompaniment_path
+
+    # Step 4: Copy output to static directory
     output_filename = f"{job.job_id}_no_vocals.wav"
     output_path = manager.output_dir / output_filename
     
     logger.info(f"Copying output to: {output_path}")
-    shutil.copy2(accompaniment_path, output_path)
+    shutil.copy2(final_path, output_path)
     
     if not output_path.exists():
         raise RuntimeError(f"Failed to copy output file to {output_path}")
