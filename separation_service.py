@@ -14,12 +14,15 @@ Audio Quality Optimizations for Industrial Sounds:
   * Important for metal drilling, impacts, tool sounds which have high-frequency content
   * Trade-off: ~2.75x slower than 16kHz, but much better quality
 - Keeps stereo if input is stereo (better spatial information)
-- Blends 10% of HIGH-FREQUENCY vocals (>5kHz) back into accompaniment
-  * Strategy: Human speech is 300-3000Hz, tool sounds are 5-20kHz
-  * High-pass filter (>5kHz) on vocals before blending:
-    - Recovers high-frequency tool sounds misclassified as vocals
-    - Avoids bringing back human speech (which is in lower frequencies)
-  * Spleeter was trained on music, not industrial sounds, so misclassification happens
+
+Aggressive Speech Suppression (ENABLED):
+- High-pass filter at 6kHz removes speech fundamentals (300-3000Hz)
+- Notch filter at 5-7kHz removes sibilants, breathing sounds, ending sounds
+  * These artifacts (s, sh, ch sounds, breathing) are particularly annoying
+  * They occur in 4-8kHz range, so notch filter specifically targets them
+- Tool sounds (drilling, metal impacts) have energy > 6-8kHz, so they survive
+- Trade-off: Some tool sound quality in low/mid frequencies is sacrificed
+  for maximum speech removal
 
 Expected Performance:
 - ~25-30 seconds for 1 minute audio on CPU (with 44.1kHz)
@@ -65,12 +68,14 @@ VOCALS_BLEND_RATIO = 0.0
 VOCALS_HIGHPASS_FREQ = 5000  # Only used if VOCALS_BLEND_RATIO > 0.0
 
 # Aggressive speech suppression on final accompaniment:
-# - Apply a strong high-pass filter to the accompaniment output.
-# - This heavily attenuates human speech (mostly < 3-4kHz).
-# - Tool sounds (drilling, metal impacts) often have significant energy > 4-5kHz,
-#   so some characteristics are preserved, but low/mid-frequency content will be lost.
+# - Apply a strong high-pass filter + notch filter to remove speech artifacts
+# - Human speech: 300-3000Hz (fundamental), but sibilants/breathing can reach 4-8kHz
+# - Strategy: High-pass at 6kHz + notch filter at 5-7kHz to remove sibilants/breathing
+# - Tool sounds (drilling, metal impacts) have significant energy > 6-8kHz
 ENABLE_SPEECH_SUPPRESSION = True
-SPEECH_SUPPRESSION_HIGHPASS_FREQ = 4000  # Hz; increase for stronger speech removal
+SPEECH_SUPPRESSION_HIGHPASS_FREQ = 6000  # Hz; high-pass to remove speech fundamentals
+SPEECH_SUPPRESSION_NOTCH_CENTER = 6000  # Hz; center frequency for notch filter
+SPEECH_SUPPRESSION_NOTCH_WIDTH = 2000  # Hz; width of notch (removes 5-7kHz range)
 
 # Model download configuration
 SPLEETER_MODEL_URL = "https://github.com/deezer/spleeter/releases/download/v1.4.0/2stems.tar.gz"
@@ -306,19 +311,37 @@ def _blend_audio_sync(
 
 def _suppress_speech_sync(input_path: Path, output_path: Path) -> None:
     """
-    Apply aggressive speech suppression using a high-pass filter.
+    Apply aggressive speech suppression using high-pass + notch filters.
 
-    This is a lossy operation aimed at *removing human speech as much as possible*,
-    even if some tool sound quality is sacrificed.
+    This removes:
+    - Speech fundamentals (300-3000Hz) via high-pass filter
+    - Sibilants, breathing sounds, ending sounds (4-8kHz) via notch filter
+    - These artifacts are particularly annoying when mixed with tool sounds
 
-    - Human speech energy is mostly < 3-4kHz.
-    - We apply a strong high-pass filter at SPEECH_SUPPRESSION_HIGHPASS_FREQ.
-    - Tool sounds (drilling/metal) often have significant high-frequency content
-      that survives this filter.
+    Strategy:
+    - High-pass at 6kHz removes speech fundamentals
+    - Notch filter at 5-7kHz removes sibilants (s, sh, ch) and breathing sounds
+    - Tool sounds (drilling, metal impacts) have energy > 6-8kHz, so they survive
     """
     logger.info(
-        f"Applying aggressive speech suppression high-pass filter at "
-        f"{SPEECH_SUPPRESSION_HIGHPASS_FREQ}Hz"
+        f"Applying aggressive speech suppression: "
+        f"high-pass at {SPEECH_SUPPRESSION_HIGHPASS_FREQ}Hz, "
+        f"notch at {SPEECH_SUPPRESSION_NOTCH_CENTER}Hz "
+        f"(width: {SPEECH_SUPPRESSION_NOTCH_WIDTH}Hz)"
+    )
+
+    # FFmpeg filter chain:
+    # 1. High-pass filter to remove speech fundamentals (< 6kHz)
+    # 2. Notch filter (equalizer with negative gain) to remove sibilants/breathing (5-7kHz)
+    #    Using equalizer with negative gain as a notch filter
+    notch_low = SPEECH_SUPPRESSION_NOTCH_CENTER - SPEECH_SUPPRESSION_NOTCH_WIDTH // 2
+    notch_high = SPEECH_SUPPRESSION_NOTCH_CENTER + SPEECH_SUPPRESSION_NOTCH_WIDTH // 2
+    
+    # Create filter chain: highpass + equalizer (notch) at 5-7kHz
+    # Equalizer: center=6000Hz, bandwidth=2000Hz, gain=-20dB (strong reduction)
+    filter_chain = (
+        f"highpass=f={SPEECH_SUPPRESSION_HIGHPASS_FREQ},"
+        f"equalizer=f={SPEECH_SUPPRESSION_NOTCH_CENTER}:width_type=h:width={SPEECH_SUPPRESSION_NOTCH_WIDTH}:g=-20"
     )
 
     cmd = [
@@ -327,7 +350,7 @@ def _suppress_speech_sync(input_path: Path, output_path: Path) -> None:
         "-i",
         str(input_path),
         "-af",
-        f"highpass=f={SPEECH_SUPPRESSION_HIGHPASS_FREQ}",
+        filter_chain,
         "-acodec",
         "pcm_s16le",
         str(output_path),
