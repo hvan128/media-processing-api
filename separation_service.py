@@ -4,21 +4,21 @@ Vocal Separation Service Module
 Handles speech suppression using FFmpeg's RNNoise-based filters, optimized for extracting industrial sounds.
 
 Design Decisions:
-- Uses FFmpeg's `arnndn` filter (RNNoise-based) for speech suppression
+- Uses FFmpeg's `arnndn` filter (RNNoise-based) as PRIMARY method for speech suppression
+- Neural network-based approach provides superior speech removal vs frequency filtering
 - Lightweight CPU-only operation, much faster than Spleeter
-- No Python ML dependencies required - uses FFmpeg's built-in filters
 - Returns audio with speech removed (industrial sounds preserved)
 
 Audio Processing Pipeline:
 1. Preprocess audio to 48kHz mono (RNNoise requirement)
-2. Apply FFmpeg's arnndn filter to suppress speech/noise
-3. Apply additional high-pass filtering to remove residual speech artifacts
-4. Optional: Apply spectral subtraction for aggressive speech removal
+2. Apply FFmpeg's arnndn filter FIRST (neural speech suppression)
+3. Apply light post-processing (mild high-pass to remove rumble only)
+4. Preserve industrial sounds by using conservative filtering after arnndn
 
 FFmpeg RNNoise Benefits:
+- Neural network trained specifically for speech/noise separation
 - ~10x faster than Spleeter
 - No Python ML dependencies (~1.5GB savings)
-- Uses RNNoise neural network via FFmpeg
 - Real-time capable
 
 Expected Performance:
@@ -26,9 +26,9 @@ Expected Performance:
 - Real-time capable for streaming applications
 
 Limitations:
+- Requires FFmpeg compiled with librnnoise support
 - arnndn operates at 48kHz mono
-- Optimized for voice calls, may miss some speech frequencies
-- Some artifacts possible in complex audio
+- Model file must be available
 """
 
 import shutil
@@ -36,8 +36,11 @@ import subprocess
 import asyncio
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
+
+import httpx
 
 from job_manager import Job, JobManager
 from downloader import download_file
@@ -51,41 +54,78 @@ TARGET_SAMPLE_RATE = 48000
 TARGET_CHANNELS = 1
 
 # Speech suppression parameters
-# arnndn filter parameters (optional - requires FFmpeg compiled with librnnoise)
-ARNDN_MIX = 0.5  # Mix factor: 0.0 = full noise reduction, 1.0 = no reduction
-ENABLE_ARNDN = False  # Disabled by default - most FFmpeg builds don't include arnndn
+# arnndn filter - PRIMARY method for speech suppression
+ENABLE_ARNDN = True  # Enabled by default - use neural network suppression
+ARNDN_MIX = 0.0  # Full suppression (0.0 = maximum noise/speech reduction)
+RNNOISE_MODEL_URL = "https://github.com/xiph/rnnoise/raw/master/src/rnnoise_model.rnnn"
 
-# Aggressive speech suppression settings
-# Speech fundamentals: 300-3000Hz, harmonics up to 8kHz
-# Sibilants (s, sh, ch): 4-8kHz
-SPEECH_HIGHPASS_FREQ = 5000  # Aggressive: remove everything below 5kHz (speech range)
-SPEECH_NOTCH_CENTER = 2000  # Notch filter at 2kHz (strong speech fundamental)
-SPEECH_NOTCH_WIDTH = 1500  # Width: removes 1.25-2.75kHz range
-SPEECH_NOTCH_GAIN = -30  # Strong attenuation in dB
+# Model file path
+# Use MODEL_PATH env var if set (Docker), otherwise use app directory
+_model_base = Path(os.environ.get("MODEL_PATH", "/app"))
+RNNOISE_MODEL_PATH = _model_base / "rnnoise_model.rnnn"
 
-# Additional filtering
-RESIDUAL_HIGHPASS_FREQ = 100  # High-pass filter to remove low rumble after processing
-ENABLE_RESIDUAL_FILTER = True  # Apply additional filtering on output
-ENABLE_NOTCH_FILTERS = True  # Use notch filters for aggressive speech removal
+# Post-processing filters (light, only for cleanup)
+# Reduced from aggressive 5kHz to preserve industrial sounds
+POST_HIGHPASS_FREQ = 2500  # Light high-pass: 2.5kHz (removes residual speech, preserves metal sounds)
+RESIDUAL_HIGHPASS_FREQ = 100  # High-pass filter to remove low rumble only
+ENABLE_RESIDUAL_FILTER = True  # Apply light post-processing
 
 # Global state
 _model_loaded = False
 _model_loading_error = None
+_arnndn_available = False
+
+
+def _download_rnnoise_model():
+    """
+    Download RNNoise model file if it doesn't exist.
+    
+    Downloads the standard RNNoise model from xiph/rnnoise repository.
+    This model is required for FFmpeg's arnndn filter.
+    """
+    if RNNOISE_MODEL_PATH.exists():
+        logger.info(f"RNNoise model already exists at {RNNOISE_MODEL_PATH}")
+        return
+    
+    logger.info(f"Downloading RNNoise model from: {RNNOISE_MODEL_URL}")
+    
+    # Create model directory if needed
+    RNNOISE_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Download with redirect support
+        with httpx.Client(follow_redirects=True, timeout=60.0) as client:
+            response = client.get(RNNOISE_MODEL_URL)
+            response.raise_for_status()
+            
+            # Save model file
+            with open(RNNOISE_MODEL_PATH, "wb") as f:
+                f.write(response.content)
+        
+        logger.info(f"RNNoise model downloaded to: {RNNOISE_MODEL_PATH}")
+        
+        # Verify file exists and has content
+        if not RNNOISE_MODEL_PATH.exists() or RNNOISE_MODEL_PATH.stat().st_size == 0:
+            raise RuntimeError(f"Model download failed: file is empty or missing")
+        
+    except Exception as e:
+        error_msg = f"Failed to download RNNoise model: {e}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
 
 def load_model():
     """
-    Initialize speech suppression system.
+    Initialize speech suppression system with RNNoise.
     
-    Since we're using FFmpeg's built-in filters, we just need to verify
-    FFmpeg is available and has the arnndn filter compiled in.
+    Downloads RNNoise model file and verifies FFmpeg has arnndn filter support.
     """
-    global _model_loaded, _model_loading_error
+    global _model_loaded, _model_loading_error, _arnndn_available
     
     if _model_loaded:
         return
     
-    print("Initializing FFmpeg-based speech suppression...")
+    print("Initializing RNNoise-based speech suppression...")
     
     try:
         # Check if FFmpeg is available
@@ -108,17 +148,26 @@ def load_model():
         )
         
         filters_output = result.stdout.decode() + result.stderr.decode()
-        if "arnndn" not in filters_output:
-            logger.info(
-                "FFmpeg arnndn filter not available. Using high-pass filtering for speech suppression. "
-                "This is expected with standard FFmpeg builds."
+        if "arnndn" in filters_output:
+            _arnndn_available = True
+            logger.info("FFmpeg arnndn filter is available")
+            
+            # Download RNNoise model file
+            _download_rnnoise_model()
+        else:
+            _arnndn_available = False
+            logger.warning(
+                "FFmpeg arnndn filter not available. Speech suppression will use fallback method. "
+                "For best results, compile FFmpeg with --enable-librnnoise"
             )
-            # Continue anyway - we use high-pass filtering as the primary method
         
         _model_loaded = True
         _model_loading_error = None
         
-        print("FFmpeg speech suppression initialized successfully")
+        if _arnndn_available:
+            print(f"RNNoise speech suppression initialized successfully (model: {RNNOISE_MODEL_PATH})")
+        else:
+            print("Speech suppression initialized (fallback mode - arnndn not available)")
         
     except FileNotFoundError:
         error_msg = "FFmpeg not found. Please install FFmpeg."
@@ -169,50 +218,44 @@ def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
 
 def _apply_speech_suppression_sync(input_path: Path, output_path: Path) -> None:
     """
-    Apply aggressive speech suppression using multiple FFmpeg filters.
+    Apply speech suppression using FFmpeg's arnndn filter (RNNoise neural network).
     
-    Uses a multi-stage approach:
-    1. Notch filter to remove speech fundamentals (1.25-2.75kHz)
-    2. High-pass filter at 5kHz to remove all speech frequencies
-    3. Spectral gating to reduce quiet speech remnants
+    PRIMARY METHOD: arnndn filter with full suppression (m=0.0)
+    This uses a neural network trained specifically for speech/noise separation.
+    
+    POST-PROCESSING: Light filtering only to remove residual artifacts
+    - Mild high-pass at 2.5kHz (removes residual speech, preserves industrial sounds)
+    - High-pass at 100Hz (removes rumble only)
     
     Args:
         input_path: Path to preprocessed audio (48kHz mono)
         output_path: Path to output with speech suppressed
     """
-    logger.info(f"Applying aggressive speech suppression: {input_path} -> {output_path}")
+    logger.info(f"Applying RNNoise-based speech suppression: {input_path} -> {output_path}")
     
-    # Build filter chain with multiple stages
+    # Build filter chain - arnndn FIRST, then light post-processing
     filters = []
     
-    # Try arnndn filter if enabled and available (RNNoise-based)
-    if ENABLE_ARNDN:
-        filters.append(f"arnndn=mix={ARNDN_MIX}")
+    # Stage 1: PRIMARY - RNNoise neural network suppression
+    if ENABLE_ARNDN and _arnndn_available:
+        # Use external model file with full suppression (m=0.0)
+        model_path_str = str(RNNOISE_MODEL_PATH.absolute())
+        filters.append(f"arnndn=model={model_path_str}:m={ARNDN_MIX}")
+        logger.info(f"Applying arnndn filter with model: {model_path_str}, mix={ARNDN_MIX} (full suppression)")
+    else:
+        logger.warning("arnndn filter not available, using fallback method")
+        # Fallback: use high-pass filtering
+        filters.append(f"highpass=f={POST_HIGHPASS_FREQ}")
+        logger.info(f"Using fallback high-pass filter at {POST_HIGHPASS_FREQ}Hz")
     
-    # Stage 1: Notch filter to remove speech fundamentals (1.25-2.75kHz)
-    # This targets the strongest speech frequencies
-    if ENABLE_NOTCH_FILTERS:
-        # Use equalizer as notch filter (negative gain)
-        notch_low = SPEECH_NOTCH_CENTER - SPEECH_NOTCH_WIDTH // 2
-        notch_high = SPEECH_NOTCH_CENTER + SPEECH_NOTCH_WIDTH // 2
-        # Create notch using equalizer with negative gain
-        filters.append(
-            f"equalizer=f={SPEECH_NOTCH_CENTER}:width_type=h:width={SPEECH_NOTCH_WIDTH}:g={SPEECH_NOTCH_GAIN}"
-        )
-        logger.info(f"Applying notch filter at {SPEECH_NOTCH_CENTER}Hz (width: {SPEECH_NOTCH_WIDTH}Hz, gain: {SPEECH_NOTCH_GAIN}dB)")
+    # Stage 2: POST-PROCESSING - Light filtering only
+    # Mild high-pass to remove residual speech (preserves industrial sounds > 2.5kHz)
+    if POST_HIGHPASS_FREQ > 0:
+        filters.append(f"highpass=f={POST_HIGHPASS_FREQ}")
+        logger.info(f"Applying post-processing high-pass at {POST_HIGHPASS_FREQ}Hz")
     
-    # Stage 2: Aggressive high-pass filter to remove all speech frequencies
-    # Speech is 300-3000Hz, but harmonics and sibilants can reach 4-8kHz
-    # Using 5kHz cutoff removes virtually all speech content
-    filters.append(f"highpass=f={SPEECH_HIGHPASS_FREQ}")
-    logger.info(f"Applying high-pass filter at {SPEECH_HIGHPASS_FREQ}Hz")
-    
-    # Stage 3: Additional high-pass at 100Hz to remove rumble
+    # Stage 3: Remove rumble only
     filters.append(f"highpass=f={RESIDUAL_HIGHPASS_FREQ}")
-    
-    # Stage 4: Spectral gating - reduce quiet sections (likely speech remnants)
-    # This helps remove quiet speech that might pass through filters
-    filters.append("agate=threshold=0.01:ratio=2:attack=1:release=50")
     
     # Combine all filters
     filter_chain = ",".join(filters) if filters else "anull"
@@ -245,7 +288,7 @@ def _apply_speech_suppression_sync(input_path: Path, output_path: Path) -> None:
 
 def _apply_highpass_only_sync(input_path: Path, output_path: Path) -> None:
     """
-    Fallback: Apply aggressive high-pass filter only.
+    Fallback: Apply high-pass filter only (when arnndn is not available).
     
     This is a simpler approach that removes low frequencies where speech
     fundamentals typically reside (300-3000Hz).
@@ -254,14 +297,12 @@ def _apply_highpass_only_sync(input_path: Path, output_path: Path) -> None:
         input_path: Path to input audio
         output_path: Path to output
     """
-    logger.info(f"Applying aggressive high-pass filter (fallback): {input_path} -> {output_path}")
+    logger.info(f"Applying high-pass filter (fallback): {input_path} -> {output_path}")
     
-    # Very aggressive high-pass to remove speech fundamentals
-    # Using 5kHz cutoff to remove virtually all speech content
-    highpass_freq = SPEECH_HIGHPASS_FREQ
+    # Use conservative high-pass to preserve industrial sounds
+    highpass_freq = POST_HIGHPASS_FREQ
     
-    # Add spectral gating to reduce quiet speech
-    filter_chain = f"highpass=f={highpass_freq},agate=threshold=0.01:ratio=2:attack=1:release=50"
+    filter_chain = f"highpass=f={highpass_freq},highpass=f={RESIDUAL_HIGHPASS_FREQ}"
     
     cmd = [
         "ffmpeg", "-y",
@@ -291,7 +332,7 @@ def _apply_residual_filter_sync(input_path: Path, output_path: Path) -> None:
     
     Uses FFmpeg filters:
     - Compressor to even out levels
-    - Gentle noise gate to reduce quiet speech remnants
+    - High-pass at 100Hz to remove rumble
     """
     if not ENABLE_RESIDUAL_FILTER:
         shutil.copy2(input_path, output_path)
@@ -300,8 +341,8 @@ def _apply_residual_filter_sync(input_path: Path, output_path: Path) -> None:
     logger.info(f"Applying residual filtering: {input_path} -> {output_path}")
     
     # Filter chain:
-    # 1. Compressor to even out levels
-    # 2. High-pass at 100Hz to remove rumble
+    # 1. High-pass at 100Hz to remove rumble
+    # 2. Compressor to even out levels
     filter_chain = (
         f"highpass=f={RESIDUAL_HIGHPASS_FREQ},"
         f"acompressor=threshold=-20dB:ratio=4:attack=5:release=50"
@@ -336,8 +377,8 @@ def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) ->
     
     Pipeline:
     1. Preprocess audio to 48kHz mono (RNNoise requirement)
-    2. Apply FFmpeg's arnndn filter for speech suppression
-    3. Apply residual filtering (optional)
+    2. Apply FFmpeg's arnndn filter FIRST (neural speech suppression)
+    3. Apply light post-processing (optional)
     4. Copy output to static directory
     
     Args:
@@ -348,7 +389,7 @@ def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) ->
     Returns:
         dict with 'file_url' pointing to the processed audio file
     """
-    logger.info(f"Processing separation job {job.job_id} with FFmpeg RNNoise")
+    logger.info(f"Processing separation job {job.job_id} with RNNoise")
     
     # Check model is ready
     if not _model_loaded:
@@ -367,13 +408,13 @@ def _process_separation_sync(job: Job, manager: JobManager, audio_path: Path) ->
     logger.info("Step 1: Preprocessing audio to 48kHz mono")
     _preprocess_audio_sync(audio_path, preprocessed_path)
     
-    # Step 2: Apply speech suppression using FFmpeg's RNNoise filter
-    logger.info("Step 2: Applying RNNoise-based speech suppression")
+    # Step 2: Apply RNNoise neural network suppression FIRST
+    logger.info("Step 2: Applying RNNoise neural network speech suppression")
     _apply_speech_suppression_sync(preprocessed_path, suppressed_path)
     
-    # Step 3: Apply residual filtering (optional)
+    # Step 3: Apply residual filtering (optional, light post-processing)
     if ENABLE_RESIDUAL_FILTER:
-        logger.info("Step 3: Applying residual filtering")
+        logger.info("Step 3: Applying light residual filtering")
         _apply_residual_filter_sync(suppressed_path, filtered_path)
         final_path = filtered_path
     else:
@@ -442,7 +483,7 @@ async def process_separation(job: Job, manager: JobManager) -> dict:
     
     await manager.update_progress(job.job_id, 30)
     
-    logger.info("Scheduling FFmpeg speech suppression in executor")
+    logger.info("Scheduling RNNoise speech suppression in executor")
     
     # Run blocking work in executor (default ThreadPoolExecutor)
     result = await loop.run_in_executor(

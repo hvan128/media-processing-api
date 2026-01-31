@@ -12,7 +12,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    CUDA_VISIBLE_DEVICES=-1
+    CUDA_VISIBLE_DEVICES=-1 \
+    MODEL_PATH=/app
 
 # Install system dependencies
 # - ffmpeg: Audio/video processing (runtime)
@@ -34,16 +35,21 @@ WORKDIR /app
 # Create data directory for temp files and outputs
 RUN mkdir -p /data/output /data/jobs
 
+# Download RNNoise model file for arnndn filter
+# This model is required for neural network-based speech suppression
+RUN curl -L -o /app/rnnoise_model.rnnn \
+    "https://github.com/xiph/rnnoise/raw/master/src/rnnoise_model.rnnn" && \
+    echo "RNNoise model downloaded"
+
 # Install Python dependencies
 # Split into stages for better caching
 
 # Install core dependencies first
 RUN pip install "numpy<2.0.0"
 
-# Speech suppression uses FFmpeg's built-in filters
-# Attempts to use arnndn filter (RNNoise-based) if available in FFmpeg build
-# Falls back to high-pass filtering if arnndn is not available
-# Standard FFmpeg builds typically don't include arnndn, so high-pass is the default
+# Speech suppression uses FFmpeg's arnndn filter (RNNoise neural network)
+# RNNoise model is downloaded above and will be used by arnndn filter
+# Falls back to high-pass filtering if arnndn is not available in FFmpeg build
 
 # Install PyAV from pre-built wheel (avoid building from source)
 # av>=12 has wheels compatible with manylinux
