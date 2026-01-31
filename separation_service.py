@@ -55,9 +55,18 @@ TARGET_CHANNELS = 1
 ARNDN_MIX = 0.5  # Mix factor: 0.0 = full noise reduction, 1.0 = no reduction
 ENABLE_ARNDN = False  # Disabled by default - most FFmpeg builds don't include arnndn
 
+# Aggressive speech suppression settings
+# Speech fundamentals: 300-3000Hz, harmonics up to 8kHz
+# Sibilants (s, sh, ch): 4-8kHz
+SPEECH_HIGHPASS_FREQ = 5000  # Aggressive: remove everything below 5kHz (speech range)
+SPEECH_NOTCH_CENTER = 2000  # Notch filter at 2kHz (strong speech fundamental)
+SPEECH_NOTCH_WIDTH = 1500  # Width: removes 1.25-2.75kHz range
+SPEECH_NOTCH_GAIN = -30  # Strong attenuation in dB
+
 # Additional filtering
 RESIDUAL_HIGHPASS_FREQ = 100  # High-pass filter to remove low rumble after processing
 ENABLE_RESIDUAL_FILTER = True  # Apply additional filtering on output
+ENABLE_NOTCH_FILTERS = True  # Use notch filters for aggressive speech removal
 
 # Global state
 _model_loaded = False
@@ -160,37 +169,52 @@ def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
 
 def _apply_speech_suppression_sync(input_path: Path, output_path: Path) -> None:
     """
-    Apply speech suppression using FFmpeg filters.
+    Apply aggressive speech suppression using multiple FFmpeg filters.
     
-    Primary method: High-pass filtering to remove speech fundamentals (300-3000Hz)
-    Optional: arnndn filter (RNNoise-based) if available in FFmpeg build
+    Uses a multi-stage approach:
+    1. Notch filter to remove speech fundamentals (1.25-2.75kHz)
+    2. High-pass filter at 5kHz to remove all speech frequencies
+    3. Spectral gating to reduce quiet speech remnants
     
     Args:
         input_path: Path to preprocessed audio (48kHz mono)
         output_path: Path to output with speech suppressed
     """
-    logger.info(f"Applying speech suppression: {input_path} -> {output_path}")
+    logger.info(f"Applying aggressive speech suppression: {input_path} -> {output_path}")
     
-    # Build filter chain
+    # Build filter chain with multiple stages
     filters = []
     
     # Try arnndn filter if enabled and available (RNNoise-based)
-    # Most standard FFmpeg builds don't include this, so it's disabled by default
     if ENABLE_ARNDN:
-        # arnndn filter: mix=0.5 means 50% noise reduction
-        # Lower mix = more aggressive suppression
         filters.append(f"arnndn=mix={ARNDN_MIX}")
     
-    # Primary method: High-pass filter to remove speech fundamentals
-    # Speech is typically 300-3000Hz, so high-pass at 3-4kHz removes most speech
-    # This is the default and most reliable method
-    highpass_freq = 3500  # Remove frequencies below 3.5kHz (speech range)
-    filters.append(f"highpass=f={highpass_freq}")
+    # Stage 1: Notch filter to remove speech fundamentals (1.25-2.75kHz)
+    # This targets the strongest speech frequencies
+    if ENABLE_NOTCH_FILTERS:
+        # Use equalizer as notch filter (negative gain)
+        notch_low = SPEECH_NOTCH_CENTER - SPEECH_NOTCH_WIDTH // 2
+        notch_high = SPEECH_NOTCH_CENTER + SPEECH_NOTCH_WIDTH // 2
+        # Create notch using equalizer with negative gain
+        filters.append(
+            f"equalizer=f={SPEECH_NOTCH_CENTER}:width_type=h:width={SPEECH_NOTCH_WIDTH}:g={SPEECH_NOTCH_GAIN}"
+        )
+        logger.info(f"Applying notch filter at {SPEECH_NOTCH_CENTER}Hz (width: {SPEECH_NOTCH_WIDTH}Hz, gain: {SPEECH_NOTCH_GAIN}dB)")
     
-    # Additional high-pass at 100Hz to remove rumble
+    # Stage 2: Aggressive high-pass filter to remove all speech frequencies
+    # Speech is 300-3000Hz, but harmonics and sibilants can reach 4-8kHz
+    # Using 5kHz cutoff removes virtually all speech content
+    filters.append(f"highpass=f={SPEECH_HIGHPASS_FREQ}")
+    logger.info(f"Applying high-pass filter at {SPEECH_HIGHPASS_FREQ}Hz")
+    
+    # Stage 3: Additional high-pass at 100Hz to remove rumble
     filters.append(f"highpass=f={RESIDUAL_HIGHPASS_FREQ}")
     
-    # Combine filters
+    # Stage 4: Spectral gating - reduce quiet sections (likely speech remnants)
+    # This helps remove quiet speech that might pass through filters
+    filters.append("agate=threshold=0.01:ratio=2:attack=1:release=50")
+    
+    # Combine all filters
     filter_chain = ",".join(filters) if filters else "anull"
     
     cmd = [
@@ -211,7 +235,7 @@ def _apply_speech_suppression_sync(input_path: Path, output_path: Path) -> None:
     if result.returncode != 0:
         error_msg = result.stderr.decode() if result.stderr else "Unknown error"
         logger.warning(
-            f"Speech suppression filter failed: {error_msg}, trying high-pass only"
+            f"Speech suppression filter failed: {error_msg}, trying simplified approach"
         )
         # Fallback: use high-pass filter only
         _apply_highpass_only_sync(input_path, output_path)
@@ -221,7 +245,7 @@ def _apply_speech_suppression_sync(input_path: Path, output_path: Path) -> None:
 
 def _apply_highpass_only_sync(input_path: Path, output_path: Path) -> None:
     """
-    Fallback: Apply high-pass filter only (when arnndn is not available).
+    Fallback: Apply aggressive high-pass filter only.
     
     This is a simpler approach that removes low frequencies where speech
     fundamentals typically reside (300-3000Hz).
@@ -230,16 +254,19 @@ def _apply_highpass_only_sync(input_path: Path, output_path: Path) -> None:
         input_path: Path to input audio
         output_path: Path to output
     """
-    logger.info(f"Applying high-pass filter (fallback): {input_path} -> {output_path}")
+    logger.info(f"Applying aggressive high-pass filter (fallback): {input_path} -> {output_path}")
     
-    # Aggressive high-pass to remove speech fundamentals
-    # Speech is typically 300-3000Hz, so high-pass at 3-4kHz removes most speech
-    highpass_freq = 3500
+    # Very aggressive high-pass to remove speech fundamentals
+    # Using 5kHz cutoff to remove virtually all speech content
+    highpass_freq = SPEECH_HIGHPASS_FREQ
+    
+    # Add spectral gating to reduce quiet speech
+    filter_chain = f"highpass=f={highpass_freq},agate=threshold=0.01:ratio=2:attack=1:release=50"
     
     cmd = [
         "ffmpeg", "-y",
         "-i", str(input_path),
-        "-af", f"highpass=f={highpass_freq}",
+        "-af", filter_chain,
         "-acodec", "pcm_s16le",
         str(output_path)
     ]
