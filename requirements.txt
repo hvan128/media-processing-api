@@ -10,10 +10,8 @@ aiofiles==23.2.1
 # Speech-to-text
 faster-whisper==1.0.0
 
-# Speech suppression (RNNoise)
-# RNNoise is much lighter than Spleeter (~10x faster, ~50MB vs 1.5GB deps)
-# Uses neural network trained specifically for speech/noise separation
-rnnoise-python==1.0.0
+# Speech suppression uses FFmpeg's built-in arnndn filter (RNNoise-based)
+# No Python dependencies required - uses FFmpeg's compiled filters
 
 # Utilities
 numpy<2.0.0
