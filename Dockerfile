@@ -16,10 +16,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Install system dependencies
 # - ffmpeg: Audio/video processing (runtime)
-# - libsndfile1: Audio file reading (for Spleeter)
+# - libsndfile1: Audio file reading
 # - libgomp: OpenMP library required by CTranslate2 (faster-whisper)
 # - curl: Health checks
-# Note: No FFmpeg dev libs needed - using pre-built PyAV wheel
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
@@ -39,9 +38,9 @@ RUN mkdir -p /data/output /data/jobs
 # Install core dependencies first
 RUN pip install "numpy<2.0.0"
 
-# Install Spleeter (uses TensorFlow, CPU-only by default)
-# Note: We use Spleeter as a library, not CLI, to avoid typer compatibility issues
-RUN pip install spleeter==2.4.0
+# Install RNNoise for speech suppression
+# Much lighter than Spleeter (~50MB vs ~1.5GB dependencies)
+RUN pip install rnnoise-python==1.0.0
 
 # Install PyAV from pre-built wheel (avoid building from source)
 # av>=12 has wheels compatible with manylinux
@@ -56,17 +55,6 @@ RUN pip install fastapi==0.109.0 uvicorn[standard]==0.27.0 \
     python-multipart==0.0.6 httpx==0.26.0 aiofiles==23.2.1 \
     pydantic==2.5.3 python-dotenv==1.0.0
 
-# Pre-download Spleeter model during build (reduces first-run latency)
-# Note: GitHub releases return 302 redirects that keras downloader doesn't handle
-# We download manually with curl which follows redirects properly
-ENV MODEL_PATH=/root/pretrained_models
-RUN mkdir -p /root/pretrained_models/2stems && \
-    curl -L -o /tmp/2stems.tar.gz \
-      "https://github.com/deezer/spleeter/releases/download/v1.4.0/2stems.tar.gz" && \
-    tar -xzf /tmp/2stems.tar.gz -C /root/pretrained_models/2stems && \
-    rm /tmp/2stems.tar.gz && \
-    echo "Spleeter model downloaded"
-
 # Copy application code
 COPY *.py .
 
@@ -74,8 +62,9 @@ COPY *.py .
 EXPOSE 8000
 
 # Health check
-# start-period=90s allows time for ML model loading (Whisper)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+# start-period=60s allows time for ML model loading (Whisper)
+# Reduced from 90s since RNNoise is much faster to initialize than Spleeter
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Run the application

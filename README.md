@@ -5,7 +5,7 @@ A self-hosted backend API for audio/video processing workflows, designed for n8n
 ## Features
 
 - **Speech-to-Text (STT)**: Transcribe audio files to SRT subtitles using faster-whisper
-- **Vocal Separation**: Remove vocals from audio using Demucs (returns instrumental track)
+- **Speech Suppression**: Remove speech from audio using RNNoise (returns background sounds)
 - **Audio Merge**: Combine multiple audio tracks into video using FFmpeg
 
 ## Architecture
@@ -23,7 +23,7 @@ A self-hosted backend API for audio/video processing workflows, designed for n8n
 │  • Automatic cleanup                                         │
 ├─────────────────────────────────────────────────────────────┤
 │  STT Service     Separation Service     Merge Service        │
-│  (faster-whisper)    (Demucs)             (FFmpeg)          │
+│  (faster-whisper)    (RNNoise)            (FFmpeg)           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -110,11 +110,11 @@ Response:
 }
 ```
 
-### Vocal Separation
+### Speech Suppression
 
 **POST /separate**
 
-Remove vocals from audio (returns instrumental).
+Remove speech from audio (returns background sounds/instrumental).
 
 ```bash
 curl -X POST http://localhost:8000/separate \
@@ -271,7 +271,7 @@ curl -O http://localhost:8000/static/550e8400-e29b-41d4-a716-446655440000.srt
 ## Performance Notes
 
 - Jobs are processed sequentially (concurrency=1) to prevent OOM on limited RAM
-- Whisper and Demucs models are loaded once at startup
+- Whisper and RNNoise models are loaded once at startup
 - Video streams are copied without re-encoding for speed
 - Temp files are automatically cleaned up after 24 hours
 
@@ -283,7 +283,7 @@ translated_api/
 ├── job_manager.py       # Job queue and state management
 ├── downloader.py        # HTTP file downloading
 ├── stt_service.py       # Speech-to-text (faster-whisper)
-├── separation_service.py # Vocal separation (Demucs)
+├── separation_service.py # Speech suppression (RNNoise)
 ├── merge_service.py     # Audio-video merge (FFmpeg)
 ├── requirements.txt     # Python dependencies
 ├── Dockerfile           # Container configuration
