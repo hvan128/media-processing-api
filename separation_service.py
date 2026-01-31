@@ -51,9 +51,9 @@ TARGET_SAMPLE_RATE = 48000
 TARGET_CHANNELS = 1
 
 # Speech suppression parameters
-# arnndn filter parameters
+# arnndn filter parameters (optional - requires FFmpeg compiled with librnnoise)
 ARNDN_MIX = 0.5  # Mix factor: 0.0 = full noise reduction, 1.0 = no reduction
-ENABLE_ARNDN = True  # Use FFmpeg's RNNoise filter
+ENABLE_ARNDN = False  # Disabled by default - most FFmpeg builds don't include arnndn
 
 # Additional filtering
 RESIDUAL_HIGHPASS_FREQ = 100  # High-pass filter to remove low rumble after processing
@@ -100,11 +100,11 @@ def load_model():
         
         filters_output = result.stdout.decode() + result.stderr.decode()
         if "arnndn" not in filters_output:
-            logger.warning(
-                "FFmpeg arnndn filter not found. Falling back to high-pass filtering only. "
-                "For best results, compile FFmpeg with --enable-librnnoise"
+            logger.info(
+                "FFmpeg arnndn filter not available. Using high-pass filtering for speech suppression. "
+                "This is expected with standard FFmpeg builds."
             )
-            # Continue anyway - we can use alternative filters
+            # Continue anyway - we use high-pass filtering as the primary method
         
         _model_loaded = True
         _model_loading_error = None
@@ -160,30 +160,34 @@ def _preprocess_audio_sync(input_path: Path, output_path: Path) -> None:
 
 def _apply_speech_suppression_sync(input_path: Path, output_path: Path) -> None:
     """
-    Apply speech suppression using FFmpeg's arnndn filter (RNNoise-based).
+    Apply speech suppression using FFmpeg filters.
     
-    The arnndn filter uses RNNoise neural network to suppress noise/speech.
-    We use it in reverse: suppress speech to keep background sounds.
+    Primary method: High-pass filtering to remove speech fundamentals (300-3000Hz)
+    Optional: arnndn filter (RNNoise-based) if available in FFmpeg build
     
     Args:
         input_path: Path to preprocessed audio (48kHz mono)
         output_path: Path to output with speech suppressed
     """
-    logger.info(f"Applying RNNoise-based speech suppression: {input_path} -> {output_path}")
+    logger.info(f"Applying speech suppression: {input_path} -> {output_path}")
     
     # Build filter chain
     filters = []
     
-    # Use arnndn filter if available (RNNoise-based)
-    # arnndn suppresses noise, but we can use it to suppress speech
-    # by applying it and then inverting the result
+    # Try arnndn filter if enabled and available (RNNoise-based)
+    # Most standard FFmpeg builds don't include this, so it's disabled by default
     if ENABLE_ARNDN:
-        # arnndn filter: model=mix=0.5 means 50% noise reduction
+        # arnndn filter: mix=0.5 means 50% noise reduction
         # Lower mix = more aggressive suppression
         filters.append(f"arnndn=mix={ARNDN_MIX}")
     
-    # Apply high-pass filter to remove speech fundamentals (300-3000Hz)
-    # This helps remove residual speech after RNNoise processing
+    # Primary method: High-pass filter to remove speech fundamentals
+    # Speech is typically 300-3000Hz, so high-pass at 3-4kHz removes most speech
+    # This is the default and most reliable method
+    highpass_freq = 3500  # Remove frequencies below 3.5kHz (speech range)
+    filters.append(f"highpass=f={highpass_freq}")
+    
+    # Additional high-pass at 100Hz to remove rumble
     filters.append(f"highpass=f={RESIDUAL_HIGHPASS_FREQ}")
     
     # Combine filters
@@ -207,7 +211,7 @@ def _apply_speech_suppression_sync(input_path: Path, output_path: Path) -> None:
     if result.returncode != 0:
         error_msg = result.stderr.decode() if result.stderr else "Unknown error"
         logger.warning(
-            f"Speech suppression filter failed: {error_msg}, trying alternative approach"
+            f"Speech suppression filter failed: {error_msg}, trying high-pass only"
         )
         # Fallback: use high-pass filter only
         _apply_highpass_only_sync(input_path, output_path)

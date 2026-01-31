@@ -18,13 +18,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # - ffmpeg: Audio/video processing (runtime)
 # - libsndfile1: Audio file reading
 # - libgomp: OpenMP library required by CTranslate2 (faster-whisper)
-# - librnnoise-dev: RNNoise library for FFmpeg's arnndn filter (optional but recommended)
 # - curl: Health checks
+# Note: librnnoise-dev is not in standard repos, so we use FFmpeg's built-in filters
+# with high-pass filtering fallback for speech suppression
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     libgomp1 \
-    librnnoise-dev \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -40,9 +40,10 @@ RUN mkdir -p /data/output /data/jobs
 # Install core dependencies first
 RUN pip install "numpy<2.0.0"
 
-# Speech suppression uses FFmpeg's built-in arnndn filter (RNNoise-based)
-# librnnoise-dev is installed above to enable arnndn filter in FFmpeg
-# If arnndn is not available, the code falls back to high-pass filtering
+# Speech suppression uses FFmpeg's built-in filters
+# Attempts to use arnndn filter (RNNoise-based) if available in FFmpeg build
+# Falls back to high-pass filtering if arnndn is not available
+# Standard FFmpeg builds typically don't include arnndn, so high-pass is the default
 
 # Install PyAV from pre-built wheel (avoid building from source)
 # av>=12 has wheels compatible with manylinux
