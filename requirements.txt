@@ -9,6 +9,7 @@ aiofiles==23.2.1
 
 # Speech-to-text
 faster-whisper==1.0.0
+requests>=2.31.0  # Required by faster-whisper
 
 # Speech suppression uses FFmpeg's built-in arnndn filter (RNNoise-based)
 # No Python dependencies required - uses FFmpeg's compiled filters

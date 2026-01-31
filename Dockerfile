@@ -51,7 +51,7 @@ RUN pip install av>=12.0.0 --only-binary :all:
 
 # Install faster-whisper (skip av since we installed it above)
 RUN pip install faster-whisper==1.0.0 --no-deps && \
-    pip install ctranslate2 huggingface_hub tokenizers onnxruntime
+    pip install ctranslate2 huggingface_hub tokenizers onnxruntime requests
 
 # Install FastAPI and other dependencies
 RUN pip install fastapi==0.109.0 uvicorn[standard]==0.27.0 \
