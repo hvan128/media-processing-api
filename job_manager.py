@@ -33,6 +33,7 @@ class JobType(str, Enum):
     STT = "stt"
     SEPARATE = "separate"
     MERGE = "merge"
+    TTS = "tts"
 
 
 @dataclass

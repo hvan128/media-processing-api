@@ -26,6 +26,7 @@ from job_manager import job_manager, JobType, JobStatus
 from stt_service import load_model as load_whisper_model, process_stt
 from separation_service import load_model as load_spleeter_model, process_separation
 from merge_service import process_merge
+from tts_service import process_tts, save_api_key as save_elevenlabs_api_key
 
 
 # ====================
@@ -60,6 +61,42 @@ class MergeRequest(BaseModel):
     """Request body for Audio-Video Merge endpoint"""
     inputs: list[MergeInput] = Field(..., min_length=2, description="List of inputs (exactly 1 video, 1+ audio)")
     options: MergeOptions = Field(default_factory=MergeOptions, description="Merge options")
+
+
+class TTSRequest(BaseModel):
+    """
+    Request body for Text-to-Speech endpoint
+    
+    Example curl:
+        curl -X POST http://<server>/tts \\
+          -H "Content-Type: application/json" \\
+          -d '{
+            "text":"Hello world",
+            "voice_id":"<voice_id>"
+          }'
+    """
+    text: str = Field(..., description="Text to synthesize into speech")
+    voice_id: str = Field(..., description="ElevenLabs voice ID")
+    model_id: Optional[str] = Field(default="eleven_monolingual_v1", description="ElevenLabs model ID")
+    stability: Optional[float] = Field(default=0.5, ge=0.0, le=1.0, description="Voice stability (0.0-1.0)")
+    similarity_boost: Optional[float] = Field(default=0.5, ge=0.0, le=1.0, description="Voice similarity boost (0.0-1.0)")
+
+
+class ElevenLabsConfigRequest(BaseModel):
+    """
+    Request body for ElevenLabs API key configuration
+    
+    Example curl:
+        curl -X POST http://<server>/config/elevenlabs \\
+          -H "Content-Type: application/json" \\
+          -d '{"api_key":"YOUR_KEY"}'
+    """
+    api_key: str = Field(..., description="ElevenLabs API key")
+
+
+class ConfigResponse(BaseModel):
+    """Response for configuration endpoints"""
+    status: str = "ok"
 
 
 class JobCreatedResponse(BaseModel):
@@ -129,6 +166,7 @@ async def lifespan(app: FastAPI):
     job_manager.register_handler(JobType.STT, process_stt)
     job_manager.register_handler(JobType.SEPARATE, process_separation)
     job_manager.register_handler(JobType.MERGE, process_merge)
+    job_manager.register_handler(JobType.TTS, process_tts)
     
     # Step 3: Start job worker
     await job_manager.start()
@@ -302,6 +340,69 @@ async def create_merge_job(request: MergeRequest):
     )
     
     return JobCreatedResponse(job_id=job.job_id, status="pending")
+
+
+@app.post("/tts", response_model=JobCreatedResponse)
+async def create_tts_job(request: TTSRequest):
+    """
+    Create a Text-to-Speech job using ElevenLabs.
+    
+    Synthesizes the provided text into speech using the specified voice.
+    The API key must be configured first via POST /config/elevenlabs.
+    
+    - **text**: Text to synthesize into speech
+    - **voice_id**: ElevenLabs voice ID
+    - **model_id**: ElevenLabs model ID (default: eleven_monolingual_v1)
+    - **stability**: Voice stability setting 0.0-1.0 (default: 0.5)
+    - **similarity_boost**: Voice similarity boost 0.0-1.0 (default: 0.5)
+    
+    Returns job_id for polling via GET /job/{job_id}
+    
+    Example:
+        curl -X POST http://<server>/tts \\
+          -H "Content-Type: application/json" \\
+          -d '{"text":"Hello world","voice_id":"<voice_id>"}'
+    """
+    job = await job_manager.create_job(
+        JobType.TTS,
+        {
+            "text": request.text,
+            "voice_id": request.voice_id,
+            "model_id": request.model_id,
+            "stability": request.stability,
+            "similarity_boost": request.similarity_boost
+        }
+    )
+    
+    return JobCreatedResponse(job_id=job.job_id, status="pending")
+
+
+@app.post("/config/elevenlabs", response_model=ConfigResponse)
+async def configure_elevenlabs(request: ElevenLabsConfigRequest):
+    """
+    Configure ElevenLabs API key.
+    
+    Saves the API key to disk for use by TTS jobs.
+    Creates /data/config directory if it doesn't exist.
+    Overwrites any existing key.
+    
+    - **api_key**: Your ElevenLabs API key
+    
+    Returns {"status": "ok"} on success.
+    
+    Example:
+        curl -X POST http://<server>/config/elevenlabs \\
+          -H "Content-Type: application/json" \\
+          -d '{"api_key":"YOUR_KEY"}'
+    """
+    try:
+        save_elevenlabs_api_key(request.api_key)
+        return ConfigResponse(status="ok")
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save API key: {str(e)}"
+        )
 
 
 @app.get("/job/{job_id}", response_model=JobStatusResponse)
