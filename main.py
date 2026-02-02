@@ -27,6 +27,11 @@ from stt_service import load_model as load_whisper_model, process_stt
 from separation_service import load_model as load_spleeter_model, process_separation
 from merge_service import process_merge
 from tts_service import process_tts, save_api_key as save_elevenlabs_api_key
+from local_tts_service import (
+    load_model as load_valtec_model,
+    process_local_tts,
+    get_available_speakers as get_tts_speakers
+)
 
 
 # ====================
@@ -65,7 +70,9 @@ class MergeRequest(BaseModel):
 
 class TTSRequest(BaseModel):
     """
-    Request body for Text-to-Speech endpoint
+    Request body for Text-to-Speech endpoint (ElevenLabs - DEPRECATED)
+    
+    DEPRECATED: Use LocalTTSRequest with POST /local-tts instead.
     
     Example curl:
         curl -X POST http://<server>/tts \\
@@ -80,6 +87,52 @@ class TTSRequest(BaseModel):
     model_id: Optional[str] = Field(default="eleven_monolingual_v1", description="ElevenLabs model ID")
     stability: Optional[float] = Field(default=0.5, ge=0.0, le=1.0, description="Voice stability (0.0-1.0)")
     similarity_boost: Optional[float] = Field(default=0.5, ge=0.0, le=1.0, description="Voice similarity boost (0.0-1.0)")
+
+
+class LocalTTSRequest(BaseModel):
+    """
+    Request body for Local Text-to-Speech endpoint (Valtec TTS)
+    
+    Vietnamese TTS using locally-hosted Valtec model.
+    
+    Available voices:
+    - NF: Northern Female (Miền Bắc - Nữ)
+    - SF: Southern Female (Miền Nam - Nữ)
+    - NM1: Northern Male 1 (Miền Bắc - Nam)
+    - NM2: Northern Male 2 (Miền Bắc - Nam)
+    - SM: Southern Male (Miền Nam - Nam)
+    
+    Example curl:
+        # Basic usage:
+        curl -X POST http://localhost:8000/local-tts \\
+          -H "Content-Type: application/json" \\
+          -d '{
+            "text": "Xin chào, đây là test TTS local"
+          }'
+        
+        # With options:
+        curl -X POST http://localhost:8000/local-tts \\
+          -H "Content-Type: application/json" \\
+          -d '{
+            "text": "Xin chào các bạn",
+            "voice": "NF",
+            "speed": 1.0
+          }'
+        
+        # Check job:
+        curl http://localhost:8000/job/<job_id>
+    """
+    text: str = Field(..., min_length=1, description="Vietnamese text to synthesize into speech")
+    voice: Optional[str] = Field(
+        default="NF",
+        description="Speaker voice: NF (Northern Female), SF (Southern Female), NM1/NM2 (Northern Male), SM (Southern Male)"
+    )
+    speed: Optional[float] = Field(
+        default=1.0,
+        ge=0.5,
+        le=2.0,
+        description="Speech speed (0.5-2.0, default 1.0 = normal, < 1.0 = faster, > 1.0 = slower)"
+    )
 
 
 class ElevenLabsConfigRequest(BaseModel):
@@ -131,6 +184,9 @@ def _load_all_models_sync():
     print("Loading Spleeter model...")
     load_spleeter_model()
     
+    print("Loading Valtec TTS model...")
+    load_valtec_model(device="cpu")  # Use CPU for VPS deployment
+    
     print("All models loaded successfully!")
 
 
@@ -167,6 +223,7 @@ async def lifespan(app: FastAPI):
     job_manager.register_handler(JobType.SEPARATE, process_separation)
     job_manager.register_handler(JobType.MERGE, process_merge)
     job_manager.register_handler(JobType.TTS, process_tts)
+    job_manager.register_handler(JobType.LOCAL_TTS, process_local_tts)
     
     # Step 3: Start job worker
     await job_manager.start()
@@ -194,13 +251,14 @@ app = FastAPI(
     - **Speech-to-Text**: Transcribe audio to SRT subtitles
     - **Vocal Separation**: Remove vocals from audio (keep instrumental)
     - **Audio Merge**: Combine multiple audio tracks into video
+    - **Local TTS**: Vietnamese text-to-speech using Valtec model (no external API)
     
     ## Usage Pattern
     1. POST to create a job (returns job_id)
     2. GET /job/{job_id} to poll for status
     3. When status is "done", result contains file_url
     """,
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -347,6 +405,8 @@ async def create_tts_job(request: TTSRequest):
     """
     Create a Text-to-Speech job using ElevenLabs.
     
+    DEPRECATED: Use POST /local-tts for local Vietnamese TTS instead.
+    
     Synthesizes the provided text into speech using the specified voice.
     The API key must be configured first via POST /config/elevenlabs.
     
@@ -371,6 +431,58 @@ async def create_tts_job(request: TTSRequest):
             "model_id": request.model_id,
             "stability": request.stability,
             "similarity_boost": request.similarity_boost
+        }
+    )
+    
+    return JobCreatedResponse(job_id=job.job_id, status="pending")
+
+
+@app.post("/local-tts", response_model=JobCreatedResponse)
+async def create_local_tts_job(request: LocalTTSRequest):
+    """
+    Create a local Text-to-Speech job using Valtec TTS.
+    
+    Synthesizes Vietnamese text into speech using locally-hosted Valtec model.
+    No external API required - runs entirely on the server.
+    
+    Available voices:
+    - **NF**: Northern Female (Miền Bắc - Nữ) [default]
+    - **SF**: Southern Female (Miền Nam - Nữ)
+    - **NM1**: Northern Male 1 (Miền Bắc - Nam)
+    - **NM2**: Northern Male 2 (Miền Bắc - Nam)
+    - **SM**: Southern Male (Miền Nam - Nam)
+    
+    Parameters:
+    - **text**: Vietnamese text to synthesize (required)
+    - **voice**: Speaker voice (default: NF)
+    - **speed**: Speech speed 0.5-2.0 (default: 1.0)
+    
+    Returns job_id for polling via GET /job/{job_id}
+    
+    Example:
+        # Create TTS job:
+        curl -X POST http://localhost:8000/local-tts \\
+          -H "Content-Type: application/json" \\
+          -d '{
+            "text": "Xin chào, đây là test TTS local"
+          }'
+        
+        # Check job:
+        curl http://localhost:8000/job/<job_id>
+    """
+    # Validate text is not empty
+    if not request.text or not request.text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty"
+        )
+    
+    job = await job_manager.create_job(
+        JobType.LOCAL_TTS,
+        {
+            "text": request.text,
+            "voice": request.voice,
+            "speed": request.speed
         }
     )
     

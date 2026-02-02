@@ -37,3 +37,6 @@ Thumbs.db
 *.bin
 *.pt
 *.onnx
+
+# Valtec TTS (cloned at build time, not committed)
+valtec-tts/

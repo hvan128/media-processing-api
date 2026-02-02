@@ -34,6 +34,7 @@ class JobType(str, Enum):
     SEPARATE = "separate"
     MERGE = "merge"
     TTS = "tts"
+    LOCAL_TTS = "local_tts"  # Valtec TTS (local Vietnamese TTS)
 
 
 @dataclass
