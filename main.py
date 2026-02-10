@@ -55,6 +55,18 @@ class MergeInput(BaseModel):
     file_url: HttpUrl = Field(..., description="Public URL to media file")
     type: Literal["video", "audio"] = Field(..., description="Input type: 'video' or 'audio'")
     volume: float = Field(default=1.0, ge=0.0, le=2.0, description="Volume multiplier (0.0-2.0, default 1.0)")
+    duration_mode: Literal[
+        "auto_match_video",
+        "always_speed",
+        "always_trim_video",
+        "keep_original",
+    ] = Field(
+        default="auto_match_video",
+        description=(
+            "How to resolve duration mismatch between this audio and the video. "
+            "Defaults to 'auto_match_video'."
+        ),
+    )
 
 
 class MergeOptions(BaseModel):
@@ -380,7 +392,10 @@ async def create_merge_job(request: MergeRequest):
         {
             "file_url": str(i.file_url),
             "type": i.type,
-            "volume": i.volume
+            "volume": i.volume,
+            # Duration mode is optional at the API level but defaults
+            # to auto_match_video, so we always serialize it explicitly.
+            "duration_mode": i.duration_mode,
         }
         for i in request.inputs
     ]

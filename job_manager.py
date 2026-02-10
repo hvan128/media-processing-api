@@ -11,13 +11,17 @@ Design Decisions:
 """
 
 import asyncio
-import uuid
+import logging
 import shutil
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
-from dataclasses import dataclass, field
+
+
+logger = logging.getLogger(__name__)
 
 
 class JobStatus(str, Enum):
@@ -254,11 +258,22 @@ class JobManager:
                             self._jobs[job_id].completed_at = datetime.utcnow()
                     
                 except Exception as e:
+                    # Log full exception for observability
+                    logger.exception(
+                        "Job %s (%s) failed with error",
+                        job_id,
+                        job.job_type,
+                    )
+
                     # Mark as error (brief lock)
                     async with self._lock:
                         if job_id in self._jobs:
                             self._jobs[job_id].status = JobStatus.ERROR
-                            self._jobs[job_id].error_message = str(e)
+                            # Ensure we never expose an empty error string
+                            message = str(e)
+                            if not message:
+                                message = f"{type(e).__name__}"
+                            self._jobs[job_id].error_message = message
                             self._jobs[job_id].completed_at = datetime.utcnow()
                     
                     # Cleanup work directory on error
