@@ -7,18 +7,27 @@ Design Decisions:
 - Uses httpx for async HTTP operations
 - Streams large files to disk to avoid memory issues
 - Preserves original file extension for FFmpeg compatibility
-- Configurable timeout and retry logic
+- Configurable timeout and retry logic (with backoff) to handle flaky networks
 """
 
-import httpx
+import asyncio
+import logging
+import mimetypes
 from pathlib import Path
 from urllib.parse import urlparse, unquote
-import mimetypes
+
+import httpx
 
 
 # HTTP client configuration
 DOWNLOAD_TIMEOUT = 300.0  # 5 minutes for large files
 CHUNK_SIZE = 1024 * 1024  # 1MB chunks for streaming
+
+# Basic retry configuration for transient network errors
+MAX_DOWNLOAD_RETRIES = 3
+RETRY_BACKOFF_BASE = 1.5  # seconds (exponential backoff)
+
+logger = logging.getLogger(__name__)
 
 # MIME type to extension mapping for common media types
 MIME_TO_EXT = {
@@ -90,50 +99,88 @@ async def download_file(
     
     Returns:
         Path to the downloaded file
-    
+
     Raises:
-        httpx.HTTPError: On network/HTTP errors
-        ValueError: On invalid URL or response
+        RuntimeError: If the download fails after retries
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
-    
-    # First, try to get extension from URL
-    extension = get_extension_from_url(url)
-    
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(DOWNLOAD_TIMEOUT),
-        follow_redirects=True
-    ) as client:
-        # Use streaming to handle large files
-        async with client.stream("GET", url) as response:
-            response.raise_for_status()
-            
-            # If no extension from URL, try Content-Type header
-            if not extension:
-                content_type = response.headers.get("content-type", "")
-                extension = get_extension_from_content_type(content_type)
-            
-            # Default extension if nothing found
-            if not extension:
-                extension = ".bin"
-            
-            # Build final path
-            dest_path = dest_dir / f"{filename}{extension}"
-            
-            # Get total size for progress tracking
-            total_size = int(response.headers.get("content-length", 0))
-            downloaded = 0
-            
-            # Stream to disk
-            with open(dest_path, "wb") as f:
-                async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    
-                    if progress_callback and total_size > 0:
-                        await progress_callback(downloaded, total_size)
-    
-    return dest_path
+
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_DOWNLOAD_RETRIES + 1):
+        # First, try to get extension from URL
+        extension = get_extension_from_url(url)
+        dest_path: Path | None = None
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(DOWNLOAD_TIMEOUT),
+                follow_redirects=True,
+            ) as client:
+                # Use streaming to handle large files
+                async with client.stream("GET", url) as response:
+                    response.raise_for_status()
+
+                    # If no extension from URL, try Content-Type header
+                    if not extension:
+                        content_type = response.headers.get("content-type", "")
+                        extension = get_extension_from_content_type(content_type)
+
+                    # Default extension if nothing found
+                    if not extension:
+                        extension = ".bin"
+
+                    # Build final path
+                    dest_path = dest_dir / f"{filename}{extension}"
+
+                    # Get total size for progress tracking
+                    total_size = int(response.headers.get("content-length", 0))
+                    downloaded = 0
+
+                    # Stream to disk
+                    with open(dest_path, "wb") as f:
+                        async for chunk in response.aiter_bytes(chunk_size=CHUNK_SIZE):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+
+                            if progress_callback and total_size > 0:
+                                await progress_callback(downloaded, total_size)
+
+            # Success
+            return dest_path
+
+        except (httpx.HTTPError, OSError) as exc:
+            last_error = exc
+
+            # Cleanup partial file if it exists
+            if dest_path is not None and dest_path.exists():
+                try:
+                    dest_path.unlink()
+                except OSError:
+                    # Best effort cleanup; ignore failures
+                    pass
+
+            if attempt >= MAX_DOWNLOAD_RETRIES:
+                message = (
+                    f"Failed to download {url} after {MAX_DOWNLOAD_RETRIES} attempts: {exc}"
+                )
+                logger.error(message)
+                raise RuntimeError(message) from exc
+
+            # Log and back off before retrying
+            backoff = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+            logger.warning(
+                "Download failed for %s on attempt %d/%d (%s). Retrying in %.1fs...",
+                url,
+                attempt,
+                MAX_DOWNLOAD_RETRIES,
+                type(exc).__name__,
+                backoff,
+            )
+            await asyncio.sleep(backoff)
+
+    # This point should not be reachable
+    raise RuntimeError(f"Failed to download {url}: unknown error")  # pragma: no cover
 
 
 async def download_files(
