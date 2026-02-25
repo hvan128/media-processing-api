@@ -161,16 +161,26 @@ async def process_stt(job: Job, manager: JobManager) -> dict:
     
     # Collect segments with progress updates
     # Since we don't know total duration upfront, estimate progress
+    audio_duration = info.duration
     segments = []
     for segment in segments_generator:
+        # Whisper pads short audio to 30s internally, which can cause the
+        # model to "loop" and re-transcribe content beyond the real end.
+        # Drop any segment that starts at or after the actual duration.
+        if audio_duration > 0 and segment.start >= audio_duration:
+            break
         segments.append(segment)
-        # Update progress based on segment timing vs detected duration
-        if info.duration > 0:
-            progress = 20 + int((segment.end / info.duration) * 70)
+        if audio_duration > 0:
+            progress = 20 + int((segment.end / audio_duration) * 70)
             progress = min(90, progress)
             await manager.update_progress(job.job_id, progress)
     
     await manager.update_progress(job.job_id, 90)
+    
+    # Clamp the last segment's end time to the actual audio duration so
+    # the SRT never extends beyond the source media.
+    if segments and audio_duration > 0 and segments[-1].end > audio_duration:
+        segments[-1] = segments[-1]._replace(end=audio_duration)
     
     # Step 3: Generate SRT output
     srt_content = segments_to_srt(segments)
