@@ -38,7 +38,8 @@ class JobType(str, Enum):
     SEPARATE = "separate"
     MERGE = "merge"
     TTS = "tts"
-    LOCAL_TTS = "local_tts"  # Valtec TTS (local Vietnamese TTS)
+    REVID_TTS = "revid_tts"  # Revid API SRT-to-Speech (key rotation on 402)
+    ECO88LABS_TTS = "eco88labs_tts"  # Eco88Labs TTS API (key rotation on 402)
 
 
 @dataclass

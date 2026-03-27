@@ -1,0 +1,9 @@
+@echo off
+set TORCHAUDIO_USE_TORCHCODEC=0
+set PATH=C:\Users\Admin\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Shared_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.0.1-full_build-shared\bin;%PATH%
+echo Starting FastAPI server...
+start /B uvicorn main:app --host 0.0.0.0 --port 8000
+echo Waiting for server to load models...
+timeout /t 60 /nobreak >nul
+echo Starting Cloudflare Tunnel...
+cloudflared tunnel run media-processing-api

@@ -19,19 +19,17 @@ from typing import Optional, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 
 from job_manager import job_manager, JobType, JobStatus
 from stt_service import load_model as load_whisper_model, process_stt
-from separation_service import load_model as load_spleeter_model, process_separation
+from separation_service import load_model as load_demucs_model, process_separation
 from merge_service import process_merge
 from tts_service import process_tts, save_api_key as save_elevenlabs_api_key
-from local_tts_service import (
-    load_model as load_valtec_model,
-    process_local_tts,
-    get_available_speakers as get_tts_speakers
-)
+from revid_tts_service import process_revid_tts, save_api_keys as save_revid_api_keys
+from eco88labs_tts_service import process_eco88labs_tts, save_api_keys as save_eco88labs_api_keys, get_voices as get_eco88labs_voices, get_any_active_key as get_eco88labs_key
 
 
 # ====================
@@ -101,50 +99,90 @@ class TTSRequest(BaseModel):
     similarity_boost: Optional[float] = Field(default=0.5, ge=0.0, le=1.0, description="Voice similarity boost (0.0-1.0)")
 
 
-class LocalTTSRequest(BaseModel):
+class SubtitleSegment(BaseModel):
+    """A single subtitle cue with timing and text."""
+    start: str = Field(..., description="Start timestamp (HH:MM:SS,mmm or HH:MM:SS.mmm)")
+    end: str = Field(..., description="End timestamp (HH:MM:SS,mmm or HH:MM:SS.mmm)")
+    text: str = Field(..., min_length=1, description="Subtitle text content")
+
+
+class RevidTTSRequest(BaseModel):
     """
-    Request body for Local Text-to-Speech endpoint (Valtec TTS)
-    
-    Vietnamese TTS using locally-hosted Valtec model.
-    
-    Available voices:
-    - NF: Northern Female (Miền Bắc - Nữ)
-    - SF: Southern Female (Miền Nam - Nữ)
-    - NM1: Northern Male 1 (Miền Bắc - Nam)
-    - NM2: Northern Male 2 (Miền Bắc - Nam)
-    - SM: Southern Male (Miền Nam - Nam)
-    
-    Example curl:
-        # Basic usage:
-        curl -X POST http://localhost:8000/local-tts \\
+    Request body for Revid SRT-to-Speech endpoint.
+
+    Uses Revid API (srt-to-speech/merge). Poll GET /job/{job_id} for status.
+    When done, result.file_url is the audio (e.g. /static/{job_id}.mp3).
+
+    Example:
+        curl -X POST http://localhost:8000/revid_tts \\
           -H "Content-Type: application/json" \\
           -d '{
-            "text": "Xin chào, đây là test TTS local"
+            "subtitles": [
+              {"start": "00:00:00,000", "end": "00:00:02,500", "text": "Đoạn 1"},
+              {"start": "00:00:02,500", "end": "00:00:05,000", "text": "Đoạn 2"}
+            ],
+            "voice_id": 1000,
+            "speed": 1.0,
+            "language": "vi-VN",
+            "add_silence": 0.5
           }'
-        
-        # With options:
-        curl -X POST http://localhost:8000/local-tts \\
+    """
+    subtitles: list[SubtitleSegment] = Field(
+        ..., min_length=1, description="Ordered list of subtitle segments (start, end, text)"
+    )
+    voice_id: int = Field(default=1000, description="Revid Voice ID from Voice Library")
+    speed: Optional[float] = Field(default=1.0, ge=0.5, le=2.5, description="Speech speed (0.5–2.5)")
+    language: Optional[str] = Field(default="vi-VN", description="Language code (e.g. vi-VN, en-US)")
+    add_silence: Optional[float] = Field(default=0.5, ge=0.0, description="Silence between segments (seconds)")
+
+
+class Eco88LabsTTSRequest(BaseModel):
+    """
+    Request body for Eco88Labs Text-to-Speech endpoint.
+
+    Uses Eco88Labs API (/tts-infer). Poll GET /job/{job_id} for status.
+    When done, result.file_url is the audio (e.g. /static/{job_id}.wav).
+
+    Example:
+        curl -X POST http://localhost:8000/eco88labs_tts \\
           -H "Content-Type: application/json" \\
           -d '{
-            "text": "Xin chào các bạn",
-            "voice": "NF",
-            "speed": 1.0
+            "gen_text": "Xin chào, đây là một thử nghiệm.",
+            "name_character": "female_voice_01",
+            "output_format": "mp3",
+            "speed": "1.0"
           }'
-        
-        # Check job:
-        curl http://localhost:8000/job/<job_id>
     """
-    text: str = Field(..., min_length=1, description="Vietnamese text to synthesize into speech")
-    voice: Optional[str] = Field(
-        default="NF",
-        description="Speaker voice: NF (Northern Female), SF (Southern Female), NM1/NM2 (Northern Male), SM (Southern Male)"
-    )
-    speed: Optional[float] = Field(
-        default=1.0,
-        ge=0.5,
-        le=2.0,
-        description="Speech speed (0.5-2.0, default 1.0 = normal, < 1.0 = faster, > 1.0 = slower)"
-    )
+    gen_text: str = Field(..., min_length=1, max_length=20000, description="Văn bản cần chuyển đổi (tối đa 20,000 ký tự)")
+    name_character: str = Field(..., description="Tên giọng đọc (lấy từ GET /eco88labs/voices)")
+    output_format: Optional[str] = Field(default="wav", description="Định dạng đầu ra: wav hoặc mp3 (mặc định: wav)")
+    sample_rate: Optional[float] = Field(default=None, description="Tần số lấy mẫu (ví dụ: 24.0, 48.0)")
+    speed: Optional[str] = Field(default="1.0", description="Tốc độ đọc (ví dụ: '0.9', '1.1')")
+    seed: Optional[int] = Field(default=None, description="Seed để tái tạo kết quả")
+
+
+class Eco88LabsConfigRequest(BaseModel):
+    """
+    Request body for Eco88Labs API keys configuration (rotation on 402).
+
+    Example:
+        curl -X POST http://<server>/config/eco88labs \\
+          -H "Content-Type: application/json" \\
+          -d '{"api_keys": ["key1", "key2"]}'
+    """
+    api_keys: list[str] = Field(..., min_length=1, description="Danh sách Eco88Labs API keys (xoay vòng khi hết balance)")
+
+
+class RevidConfigRequest(BaseModel):
+    """
+    Request body for Revid API keys configuration (rotation on 402).
+
+    Example:
+        curl -X POST http://<server>/config/revid \\
+          -H "Content-Type: application/json" \\
+          -d '{"api_keys": ["key1", "key2"]}'
+    """
+    api_keys: list[str] = Field(..., min_length=1, description="List of Revid API keys (used in order when one runs out of credits)")
 
 
 class ElevenLabsConfigRequest(BaseModel):
@@ -193,11 +231,8 @@ def _load_all_models_sync():
     print("Loading Whisper model...")
     load_whisper_model()
     
-    print("Loading Spleeter model...")
-    load_spleeter_model()
-    
-    print("Loading Valtec TTS model...")
-    load_valtec_model(device="cpu")  # Use CPU for VPS deployment
+    print("Loading Demucs model...")
+    load_demucs_model()
     
     print("All models loaded successfully!")
 
@@ -235,8 +270,9 @@ async def lifespan(app: FastAPI):
     job_manager.register_handler(JobType.SEPARATE, process_separation)
     job_manager.register_handler(JobType.MERGE, process_merge)
     job_manager.register_handler(JobType.TTS, process_tts)
-    job_manager.register_handler(JobType.LOCAL_TTS, process_local_tts)
-    
+    job_manager.register_handler(JobType.REVID_TTS, process_revid_tts)
+    job_manager.register_handler(JobType.ECO88LABS_TTS, process_eco88labs_tts)
+
     # Step 3: Start job worker
     await job_manager.start()
     
@@ -258,25 +294,34 @@ app = FastAPI(
     title="Media Processing API",
     description="""
     Self-hosted backend for audio/video processing.
-    
+
     ## Features
     - **Speech-to-Text**: Transcribe audio to SRT subtitles
     - **Vocal Separation**: Remove vocals from audio (keep instrumental)
     - **Audio Merge**: Combine multiple audio tracks into video
-    - **Local TTS**: Vietnamese text-to-speech using Valtec model (no external API)
-    
+    - **Revid TTS**: SRT-to-Speech via Revid API with API key rotation on 402 (insufficient credits)
+
     ## Usage Pattern
     1. POST to create a job (returns job_id)
     2. GET /job/{job_id} to poll for status
     3. When status is "done", result contains file_url
     """,
-    version="1.1.0",
+    version="2.0.0",
     lifespan=lifespan
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Mount static files directory for serving outputs
-# This will be available at /static/{filename}
 app.mount("/static", StaticFiles(directory=str(job_manager.output_dir)), name="static")
+# Also serve outputs at /output for separation endpoint compatibility
+app.mount("/output", StaticFiles(directory=str(job_manager.output_dir)), name="output")
 
 
 # ====================
@@ -337,11 +382,14 @@ async def create_stt_job(request: STTRequest):
 @app.post("/separate", response_model=JobCreatedResponse)
 async def create_separation_job(request: SeparateRequest):
     """
-    Create a vocal separation job.
+    Create a vocal separation job using Demucs (htdemucs).
     
-    Downloads the audio from the provided URL and separates it
-    into vocals and no_vocals tracks using Demucs.
-    Returns only the no_vocals (instrumental) track.
+    Downloads the audio and separates it into **vocal** and **instrumental**
+    tracks.  Processing runs locally (no third-party API).
+    
+    When the job is done, the result contains:
+    - ``vocal_url``: path to the isolated vocals WAV
+    - ``instrument_url``: path to the instrumental WAV
     
     - **media_url**: Public URL to audio file
     
@@ -452,56 +500,115 @@ async def create_tts_job(request: TTSRequest):
     return JobCreatedResponse(job_id=job.job_id, status="pending")
 
 
-@app.post("/local-tts", response_model=JobCreatedResponse)
-async def create_local_tts_job(request: LocalTTSRequest):
+@app.post("/revid_tts", response_model=JobCreatedResponse)
+async def create_revid_tts_job(request: RevidTTSRequest):
     """
-    Create a local Text-to-Speech job using Valtec TTS.
-    
-    Synthesizes Vietnamese text into speech using locally-hosted Valtec model.
-    No external API required - runs entirely on the server.
-    
-    Available voices:
-    - **NF**: Northern Female (Miền Bắc - Nữ) [default]
-    - **SF**: Southern Female (Miền Nam - Nữ)
-    - **NM1**: Northern Male 1 (Miền Bắc - Nam)
-    - **NM2**: Northern Male 2 (Miền Bắc - Nam)
-    - **SM**: Southern Male (Miền Nam - Nam)
-    
-    Parameters:
-    - **text**: Vietnamese text to synthesize (required)
-    - **voice**: Speaker voice (default: NF)
-    - **speed**: Speech speed 0.5-2.0 (default: 1.0)
-    
-    Returns job_id for polling via GET /job/{job_id}
-    
-    Example:
-        # Create TTS job:
-        curl -X POST http://localhost:8000/local-tts \\
-          -H "Content-Type: application/json" \\
-          -d '{
-            "text": "Xin chào, đây là test TTS local"
-          }'
-        
-        # Check job:
-        curl http://localhost:8000/job/<job_id>
+    Create a Revid SRT-to-Speech job.
+
+    Sends subtitles to Revid API (srt-to-speech/merge), polls until completed,
+    then saves audio to output. Configure API keys via POST /config/revid.
+    On 402 (insufficient credits), the service rotates to the next configured key.
+
+    - **subtitles**: List of {start, end, text} (same format as /srt-to-speech)
+    - **voice_id**: Revid Voice ID from Voice Library (integer, default 1000)
+    - **speed**: 0.5–2.5 (default 1.0)
+    - **language**: e.g. vi-VN, en-US (default vi-VN)
+    - **add_silence**: Seconds of silence between segments (default 0.5)
+
+    Returns job_id for polling via GET /job/{job_id}. Result has file_url (e.g. /static/{job_id}.mp3).
     """
-    # Validate text is not empty
-    if not request.text or not request.text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Text cannot be empty"
-        )
-    
+    subtitles_raw = [
+        {"start": s.start, "end": s.end, "text": s.text}
+        for s in request.subtitles
+    ]
     job = await job_manager.create_job(
-        JobType.LOCAL_TTS,
+        JobType.REVID_TTS,
         {
-            "text": request.text,
-            "voice": request.voice,
-            "speed": request.speed
-        }
+            "subtitles": subtitles_raw,
+            "voice_id": request.voice_id,
+            "speed": request.speed,
+            "language": request.language,
+            "add_silence": request.add_silence,
+        },
     )
-    
     return JobCreatedResponse(job_id=job.job_id, status="pending")
+
+
+@app.post("/eco88labs_tts", response_model=JobCreatedResponse)
+async def create_eco88labs_tts_job(request: Eco88LabsTTSRequest):
+    """
+    Create an Eco88Labs Text-to-Speech job.
+
+    Sends gen_text to Eco88Labs API (/tts-infer), polls /tts/status/<task_id> until completed,
+    then saves audio to output. Configure API keys via POST /config/eco88labs.
+    On 402 (INSUFFICIENT_TOKEN_BALANCE), the service rotates to the next configured key.
+
+    - **gen_text**: Văn bản cần đọc (tối đa 20,000 ký tự)
+    - **name_character**: Tên giọng đọc (lấy từ GET /eco88labs/voices)
+    - **output_format**: wav hoặc mp3 (mặc định: wav)
+    - **sample_rate**: Tần số lấy mẫu (tùy chọn)
+    - **speed**: Tốc độ đọc, ví dụ "0.9", "1.1" (mặc định: "1.0")
+    - **seed**: Seed để tái tạo kết quả (tùy chọn)
+
+    Returns job_id for polling via GET /job/{job_id}. Result has file_url (e.g. /static/{job_id}.wav).
+    """
+    job = await job_manager.create_job(
+        JobType.ECO88LABS_TTS,
+        {
+            "gen_text": request.gen_text,
+            "name_character": request.name_character,
+            "output_format": request.output_format,
+            "sample_rate": request.sample_rate,
+            "speed": request.speed,
+            "seed": request.seed,
+        },
+    )
+    return JobCreatedResponse(job_id=job.job_id, status="pending")
+
+
+@app.get("/eco88labs/voices")
+async def list_eco88labs_voices():
+    """
+    Lấy danh sách giọng đọc từ Eco88Labs.
+
+    Sử dụng API key đã cấu hình (POST /config/eco88labs).
+    Trả về danh sách voices với name, gender, language, area, emotion.
+    """
+    try:
+        voices = get_eco88labs_voices(get_eco88labs_key())
+        return {"voices": voices}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/config/eco88labs", response_model=ConfigResponse)
+async def configure_eco88labs(request: Eco88LabsConfigRequest):
+    """
+    Configure Eco88Labs API keys for rotation.
+
+    When a key returns 402 (INSUFFICIENT_TOKEN_BALANCE), the next key is used.
+    Save one key per line in config; order is preserved.
+    """
+    try:
+        save_eco88labs_api_keys(request.api_keys)
+        return ConfigResponse(status="ok")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save Eco88Labs keys: {str(e)}")
+
+
+@app.post("/config/revid", response_model=ConfigResponse)
+async def configure_revid(request: RevidConfigRequest):
+    """
+    Configure Revid API keys for rotation.
+
+    When a key returns 402 (insufficient credits), the next key is used.
+    Save one key per line in config; order is preserved.
+    """
+    try:
+        save_revid_api_keys(request.api_keys)
+        return ConfigResponse(status="ok")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save Revid keys: {str(e)}")
 
 
 @app.post("/config/elevenlabs", response_model=ConfigResponse)
@@ -542,24 +649,22 @@ async def get_job_status(job_id: str):
     Status values:
     - **pending**: Job is queued, waiting to start
     - **running**: Job is being processed (check progress)
-    - **done**: Job completed successfully (check result.file_url)
+    - **done**: Job completed successfully (check result)
     - **error**: Job failed (check error_message)
+    
+    All fields are always present in the response (null when not applicable).
     """
     job = await job_manager.get_job(job_id)
     
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    response = JobStatusResponse(status=job.status.value)
-    
-    if job.status == JobStatus.RUNNING:
-        response.progress = job.progress
-    elif job.status == JobStatus.DONE:
-        response.result = job.result
-    elif job.status == JobStatus.ERROR:
-        response.error_message = job.error_message
-    
-    return response
+    return JobStatusResponse(
+        status=job.status.value,
+        progress=job.progress,
+        result=job.result,
+        error_message=job.error_message,
+    )
 
 
 # ====================

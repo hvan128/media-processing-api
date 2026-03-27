@@ -115,7 +115,9 @@ async def process_stt(job: Job, manager: JobManager) -> dict:
         manager: JobManager for progress updates
     
     Returns:
-        dict with 'file_url' pointing to the output SRT file
+        dict with:
+            - 'file_url': path to the output SRT file
+            - 'full_script': transcript text concatenated into a single block
     """
     params = job.params
     media_url = params["media_url"]
@@ -182,8 +184,13 @@ async def process_stt(job: Job, manager: JobManager) -> dict:
     if segments and audio_duration > 0 and segments[-1].end > audio_duration:
         segments[-1] = segments[-1]._replace(end=audio_duration)
     
-    # Step 3: Generate SRT output
+    # Step 3: Generate SRT output + full plain-text transcript
     srt_content = segments_to_srt(segments)
+    full_script = " ".join(
+        segment.text.strip()
+        for segment in segments
+        if getattr(segment, "text", "").strip()
+    )
     
     # Save to output directory
     output_filename = f"{job.job_id}.srt"
@@ -198,5 +205,6 @@ async def process_stt(job: Job, manager: JobManager) -> dict:
     manager.cleanup_job_work_dir(job)
     
     return {
-        "file_url": f"/static/{output_filename}"
+        "file_url": f"/static/{output_filename}",
+        "full_script": full_script,
     }

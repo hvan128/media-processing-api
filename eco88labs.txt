@@ -1,0 +1,425 @@
+Tài liệu API Chuyển đổi Văn bản thành Giọng nói (TTS) - v1
+ Cập nhật lần cuối: 10/29/2025
+Base URL: https://eco88labs.com/api/v1
+
+🔐 1. Xác thực (Authentication)
+Tất cả các yêu cầu đến các endpoint (ngoại trừ /tts/ping) đều phải được xác thực. Bạn cần cung cấp API Key (token) của mình qua header Authorization dùng schema Bearer.
+
+Yêu cầu không hợp lệ hoặc thiếu header Authorization sẽ trả về lỗi 401 Unauthorized.
+
+Ví dụ Header:
+
+Authorization: Bearer YOUR_SECRET_API_KEY
+❌ 2. Xử lý lỗi (Error Handling)
+API sử dụng mã trạng thái HTTP tiêu chuẩn để chỉ báo thành công hoặc thất bại. Các phản hồi lỗi (4xx, 5xx) sẽ trả về một đối tượng JSON với cấu trúc sau:
+
+{  
+    "error": "Mã lỗi HTTP (ví dụ: Bad Request)",  
+    "message": "Mô tả lỗi (tiếng Việt)",  
+    "error_code": "Mã lỗi nội bộ (ví dụ: MISSING_REQUIRED_FIELD)",  
+    "details": "Chi tiết kỹ thuật (nếu có)"  
+}
+Các mã lỗi (error_code) phổ biến:
+
+INVALID_INPUT_FORMAT: Yêu cầu không phải là JSON hợp lệ.
+
+MISSING_REQUIRED_FIELD: Thiếu trường bắt buộc (ví dụ: gen_text).
+
+REQUEST_TOO_LARGE: Văn bản vượt quá giới hạn ký tự (hiện tại là 20,000).
+
+INSUFFICIENT_TOKEN_BALANCE: Không đủ token để thực hiện.
+
+RESOURCE_NOT_FOUND: Không tìm thấy tài nguyên (ví dụ: task_id hoặc name_character).
+
+TTS_SERVICE_ERROR: Dịch vụ TTS backend gặp lỗi.
+
+TTS_SERVICE_UNAVAILABLE: Không thể kết nối đến dịch vụ TTS.
+
+🚦 3. Giới hạn truy cập (Rate Limiting)
+API áp dụng giới hạn truy cập (rate limit) để đảm bảo tính ổn định của hệ thống:
+
+Tác vụ nhẹ (Balance, Voices, Status, Logs): 120 requests / phút.
+
+Tác vụ nặng (Infer, Infer-Batch): 20 requests / phút.
+
+Khi vượt quá giới hạn, API sẽ trả về lỗi 429 Too Many Requests.
+
+🔄 4. Luồng làm việc (Common Workflow)
+Các tác vụ tạo file audio (tts-infer, tts-infer-batch) là bất đồng bộ (asynchronous).
+
+Gửi yêu cầu: Bạn gọi POST /tts-infer (hoặc tts-infer-batch) với văn bản và tên giọng đọc.
+
+Nhận Task ID: Nếu yêu cầu hợp lệ, API sẽ trả về HTTP 202 Accepted cùng với một task_id.
+
+Kiểm tra trạng thái (Polling): Bạn sử dụng GET /tts/status/<task_id> để kiểm tra trạng thái của tác vụ. Bạn nên lặp lại yêu cầu này sau một khoảng thời gian (ví dụ: 1-5 giây).
+
+Nhận kết quả:
+
+Nếu status là queued hoặc processing, tiếp tục đợi.
+
+Nếu status là failed, kiểm tra trường error để biết lý do.
+
+Nếu status là completed, trường output_file_url sẽ chứa một link download (CloudFront Signed URL) có thời hạn sử dụng (ví dụ: 1 giờ) để bạn tải file audio.
+
+📡 5. Danh sách Endpoints
+🏓 5.1. Kiểm tra trạng thái API
+Kiểm tra xem dịch vụ API có đang hoạt động hay không.
+
+Endpoint: GET /tts/ping
+
+Xác thực: Không yêu cầu.
+
+Ví dụ (curl):
+
+curl -X GET https://eco88labs.com/api/v1/tts/ping
+Ví dụ (Python):
+
+import requests  
+  
+API_URL = https://eco88labs.com/api/v1
+response = requests.get(f"{API_URL}/tts/ping")  
+  
+print(response.json())
+Phản hồi (200 OK):
+
+{  
+    "message": "Pong resful api!!!"  
+}
+💰 5.2. Kiểm tra số dư (Balance)
+Lấy thông tin về số dư token TTS của tài khoản.
+
+Endpoint: GET /tts/balance
+
+Xác thực: Bắt buộc (Authorization: Bearer).
+
+Ví dụ (curl):
+
+curl -X GET https://eco88labs.com/api/v1/tts/balance \
+-H "Authorization: Bearer YOUR_SECRET_API_KEY"
+Ví dụ (Python):
+
+import requests  
+  
+API_URL = https://eco88labs.com/api/v1 
+API_KEY = "YOUR_SECRET_API_KEY"  
+headers = {"Authorization": f"Bearer {API_KEY}"}  
+  
+response = requests.get(f"{API_URL}/tts/balance", headers=headers)  
+print(response.json())
+Phản hồi (200 OK):
+
+{  
+    "user_id": 123,  
+    "token_balance": 995000,  
+    "wallet_status": "active",  
+    "total_tokens_spent": 5000  
+}
+🎙️ 5.3. Lấy danh sách giọng đọc (Voices)
+Lấy danh sách tất cả các giọng đọc (characters) công khai và đang hoạt động.
+
+Endpoint: GET /tts/voices
+
+Xác thực: Bắt buộc (Authorization: Bearer).
+
+Ví dụ (curl):
+
+curl -X GET https://eco88labs.com/api/v1/tts/voices \
+-H "Authorization: Bearer YOUR_SECRET_API_KEY"
+
+Ví dụ (Python):
+
+import requests  
+  
+API_URL = https://eco88labs.com/api/v1 
+API_KEY = "YOUR_SECRET_API_KEY"  
+headers = {"Authorization": f"Bearer {API_KEY}"}  
+  
+response = requests.get(f"{API_URL}/tts/voices", headers=headers)  
+print(response.json())
+Phản hồi (200 OK):
+
+{  
+"voices": \[  
+    {  
+    "name": "female_voice_01",  
+    "gender": "female",  
+    "language": "vi",  
+    "area": "north",  
+    "emotion": "neutral",  
+    "description": "Giọng nữ miền Bắc, trung tính."  
+    },  
+    {  
+    "name": "male_voice_01",  
+    "gender": "male",  
+    "language": "vi",  
+    "area": "south",  
+    "emotion": "happy",  
+    "description": "Giọng nam miền Nam, vui vẻ."  
+    }  
+// ...  
+\]  
+}
+🗣️ 5.4. Tạo TTS (Async Task)
+Gửi một yêu cầu chuyển đổi văn bản sang giọng nói. Đây là tác vụ bất đồng bộ.
+
+Endpoint: POST /tts-infer
+
+Xác thực: Bắt buộc (Authorization: Bearer).
+
+Tham số JSON Body:
+
+Tên	Kiểu	Bắt buộc	Mặc định	Mô tả
+gen_text	string	Có		Văn bản cần chuyển đổi. Tối đa 20,000 ký tự.
+name_character	string	Có		Tên giọng đọc (lấy từ API /tts/voices).
+output_format	string	Không	"wav"	Định dạng file đầu ra (ví dụ: "wav", "mp3").
+sample_rate	float	Không	24.0	Tần số lấy mẫu (ví dụ: 24.0, 48.0).
+speed	string	Không	"1.0"	Tốc độ đọc (ví dụ: "0.9", "1.1").
+seed	integer	Không	4242	Seed để tái tạo kết quả.
+Ví dụ (curl):
+
+curl -X POST https://eco88labs.com/api/v1/tts-infer\  
+-H "Authorization: Bearer YOUR_SECRET_API_KEY" \  
+-H "Content-Type: application/json" \  
+-d '{  
+"gen_text": "Xin chào, đây là một thử nghiệm API.",  
+"name_character": "female_voice_01",  
+"output_format": "mp3"  
+}'
+Ví dụ (Python):
+
+import requests  
+  
+API_URL = https://eco88labs.com/api/v1
+API_KEY = "YOUR_SECRET_API_KEY"  
+headers = {  
+    "Authorization: Bearer": API_KEY,  
+    "Content-Type": "application/json"  
+}  
+payload = {  
+    "gen_text": "Xin chào, đây là một thử nghiệm API.",  
+    "name_character": "female_voice_01",  
+    "output_format": "mp3"  
+}  
+  
+response = requests.post(f"{API_URL}/tts-infer", headers=headers, json=payload)  
+print(response.status_code)  
+print(response.json())
+Phản hồi (202 Accepted):
+
+{  
+    "status": "queued",  
+    "message": "Tác vụ TTS đã được gửi. Bạn có thể kiểm tra trạng thái bằng task_id đã cung cấp.",  
+    "task_id": "a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8"  
+}
+🧩 5.5. Tạo TTS hàng loạt (Async Batch Task)
+Gửi một yêu cầu chuyển đổi hàng loạt (batch) văn bản (ví dụ: phụ đề). Đây là tác vụ bất đồng bộ.
+
+Endpoint: POST /tts-infer-batch
+
+Xác thực: Bắt buộc (Authorization: Bearer).
+
+Tham số JSON Body:
+
+Tên	Kiểu	Bắt buộc	Mô tả
+subtitles	array	Có	Một mảng các đối tượng phụ đề.
+output_format	string	Không	Định dạng file audio tổng hợp (ví dụ: "wav", "mp3").
+sample_rate	float	Không	Tần số lấy mẫu (ví dụ: 24.0).
+Cấu trúc đối tượng trong subtitles:
+
+Tên	Kiểu	Bắt buộc	Mô tả
+gen_text	string	Có	Văn bản cần chuyển đổi cho phân đoạn này.
+name_character	string	Có	Tên giọng đọc cho phân đoạn này.
+id	string	Không	ID tùy chỉnh cho phân đoạn.
+speed	float	Không	Tốc độ đọc (ví dụ: 1.0).
+start_time	string	Không	Thời gian bắt đầu (định dạng HH:MM:SS,ms).
+end_time	string	Không	Thời gian kết thúc (định dạng HH:MM:SS,ms).
+Ví dụ (curl):
+
+curl -X POST https://eco88labs.com/api/v1/tts-infer-batch\  
+-H "Authorization: Bearer YOUR_SECRET_API_KEY" \  
+-H "Content-Type: application/json" \  
+-d '{  
+    "subtitles": \[  
+        {  
+          "id": "1",  
+          "gen_text": "Câu đầu tiên.",  
+          "name_character": "female_voice_01",  
+          "speed": 0.9  
+        },  
+        {  
+          "id": "2",  
+          "gen_text": "Câu thứ hai, nói bởi giọng khác.",  
+          "name_character": "male_voice_01"  
+        }  
+    \],  
+    "output_format": "mp3"  
+    }'
+Ví dụ (Python):
+
+import requests  
+  
+API_URL = https://eco88labs.com/api/v1  
+API_KEY = "YOUR_SECRET_API_KEY"  
+headers = {  
+  "Authorization: Bearer": API_KEY,  
+  "Content-Type": "application/json"  
+}  
+payload = {  
+    "subtitles": \[  
+        {  
+          "id": "1",  
+          "gen_text": "Câu đầu tiên.",  
+          "name_character": "female_voice_01",  
+          "speed": 0.9  
+        },  
+        {  
+          "id": "2",  
+          "gen_text": "Câu thứ hai, nói bởi giọng khác.",  
+          "name_character": "male_voice_01"  
+        }  
+    \],  
+    "output_format": "mp3"  
+}  
+  
+response = requests.post(f"{API_URL}/tts-infer-batch", headers=headers, json=payload)  
+print(response.status_code)  
+print(response.json())
+Phản hồi (202 Accepted):
+
+{  
+    "status": "queued",  
+    "message": "Tác vụ TTS đã được gửi. Bạn có thể kiểm tra trạng thái bằng task_id đã cung cấp.",  
+    "task_id": "z9y8x7w6-v5u4-t3s2-r1q0-p9o8n7m6l5k4"  
+}
+📊 5.6. Kiểm tra trạng thái tác vụ (Task Status)
+Kiểm tra trạng thái của một tác vụ đã gửi và nhận link download khi hoàn thành.
+
+Endpoint: GET /tts/status/<task_id>
+
+Xác thực: Bắt buộc (Authorization: Bearer).
+
+Tham số URL:
+
+task_id (string): ID của tác vụ nhận được từ /tts-infer hoặc /tts-infer-batch.
+Ví dụ (curl):
+
+curl -X GET https://eco88labs.com/api/v1/tts/status/a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8 \  
+-H "Authorization: Bearer YOUR_SECRET_API_KEY"
+Ví dụ (Python):
+
+import requests  
+import time  
+  
+API_URL = https://eco88labs.com/api/v1
+API_KEY = "YOUR_SECRET_API_KEY"  
+headers = {"Authorization": f"Bearer {API_KEY}"}  
+TASK_ID = "a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8"  
+  
+while True:  
+response = requests.get(f"{API_URL}/tts/status/{TASK_ID}", headers=headers)  
+data = response.json()  
+  
+status = data.get("status")  
+print(f"Trạng thái tác vụ: {status}")  
+  
+if status == "completed":  
+print(f"Đã hoàn thành! Link download: {data.get('output_file_url')}")  
+break  
+elif status == "failed":  
+print(f"Thất bại: {data.get('error')}")  
+break  
+  
+# Đợi 5 giây trước khi kiểm tra lại  
+time.sleep(5)
+Phản hồi (200 OK - Đang xử lý):
+
+{  
+    "task_id": "a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8",  
+    "status": "queued",  
+    "created_at": "2023-10-27T10:30:01Z",  
+    "output_file_url": null,  
+    "s3_key": null,  
+    "expires_in_seconds": null,  
+    "error": null  
+}
+Phản hồi (200 OK - Hoàn thành):
+
+{  
+    "task_id": "a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8",  
+    "status": "completed",  
+    "created_at": "2023-10-27T10:30:01Z",  
+    "output_file_url": "\[https://cloudfront-domain.com/outputs/file.mp3?Signature=...&Key-Pair-Id=\](https://cloudfront-domain.com/outputs/file.mp3?Signature=...&Key-Pair-Id=)...",  
+    "s3_key": "outputs/user/123/file.mp3",  
+    "expires_in_seconds": 3600,  
+    "error": null  
+}
+🕓 5.7. Lấy lịch sử tác vụ (TTS Logs)
+Truy xuất lịch sử các tác vụ TTS của bạn, hỗ trợ phân trang và lọc.
+
+Endpoint: GET /tts-logs
+
+Xác thực: Bắt buộc (Authorization: Bearer).
+
+Tham số Query (Tùy chọn):
+
+Tên	Kiểu	Mô tả
+page	integer	Số trang (mặc định: 1).
+per_page	integer	Số mục mỗi trang (mặc định: 10, tối đa: 100).
+q	string	Từ khóa tìm kiếm trong văn bản (gen_text).
+status	string	Lọc theo trạng thái: completed, failed, queued, pending.
+start_date	string	Lọc từ ngày (định dạng YYYY-MM-DD).
+end_date	string	Lọc đến ngày (định dạng YYYY-MM-DD).
+sort_by	string	Tên trường để sắp xếp (mặc định: created_at).
+sort_order	string	Thứ tự sắp xếp: asc hoặc desc (mặc định: desc).
+Ví dụ (curl) - Lấy trang 1, 5 mục, trạng thái "completed":
+
+curl -X GET "[https://eco88labs.com/api/v1/tts-logs?page=1&per_page=5&status=completed](https://eco88labs.com/api/v1/tts-logs?page=1&per_page=5&status=completed)" \
+-H "Authorization: Bearer YOUR_SECRET_API_KEY"
+
+Ví dụ (Python):
+
+import requests  
+  
+API_URL = https://eco88labs.com/api/v1 
+API_KEY = "YOUR_SECRET_API_KEY"  
+headers = {"Authorization": f"Bearer {API_KEY}"}  
+params = {  
+    "page": 1,  
+    "per_page": 5,  
+    "status": "completed",  
+    "sort_by": "created_at",  
+    "sort_order": "desc"  
+}  
+  
+response = requests.get(f"{API_URL}/tts-logs", headers=headers, params=params)  
+print(response.json())
+Phản hồi (200 OK):
+
+{  
+    "items": \[  
+        {  
+        "id": 101,  
+        "task_id": "a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8",  
+        "user_id": 123,  
+        "gen_text": "Xin chào, đây là một thử nghiệm API.",  
+        "ref_file_name": "voices/female_voice_01.wav",  
+        "output_file_path": "outputs/user/123/file.mp3",  
+        "status": "completed",  
+        "error_message": null,  
+        "created_at": "2023-10-27T10:30:01Z",  
+        "updated_at": "2023-10-27T10:30:15Z"  
+        },  
+    // ...  
+    \],  
+    "\_meta": {  
+        "page": 1,  
+        "per_page": 5,  
+        "total_pages": 10,  
+        "total_items": 50  
+    },  
+        "\_links": {  
+        "self": "/api/v1/tts-logs?page=1&per_page=5&status=completed",  
+        "next": "/api/v1/tts-logs?page=2&per_page=5&status=completed",  
+        "prev": null  
+    }  
+}
