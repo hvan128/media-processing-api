@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(pip show:*)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "Bash(python:*)",
+      "Read(//c/Users/Admin/AppData/Local/Programs/Python/Python310/lib/site-packages/s3tokenizer/**)",
+      "Read(//c/Users/Admin/AppData/Local/Programs/Python/Python310/lib/site-packages/**)",
+      "Bash(ls:*)",
+      "Bash(grep -n -E \"\\([0-9]{1,3}\\\\.\\){3}[0-9]{1,3}\" DEPLOYMENT.md N8N_INTEGRATION.md README.md SETUP_GUIDE.md)"
+    ]
+  }
+}
